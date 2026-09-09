@@ -17,13 +17,19 @@ mod router;
 mod server;
 mod utils;
 
+use std::path::Path;
 use std::process::ExitCode;
+
+use config::Config;
 
 /// Config path used when none is given on the command line.
 const DEFAULT_CONFIG: &str = "config.yaml";
 
+/// Exit code for a configuration that cannot be used. Distinct from 1 so a test
+/// script can tell "bad config" from any other failure.
+const EXIT_CONFIG: u8 = 2;
+
 fn main() -> ExitCode {
-    // Usage: localserver [path/to/config.yaml]
     let mut args = std::env::args().skip(1);
     let config_path = match args.next() {
         Some(arg) if arg == "-h" || arg == "--help" => {
@@ -34,9 +40,73 @@ fn main() -> ExitCode {
         None => DEFAULT_CONFIG.to_string(),
     };
 
-    // TASKS.md 1.2/1.3: load + validate the config, then TASKS.md 2.x: run the loop.
-    // Startup failures exit non-zero with a message on stderr; once the loop is
-    // running it must never terminate on a per-client error.
-    eprintln!("localserver: skeleton build, config would be loaded from {config_path:?}");
+    // Validate before binding anything: a configuration error must surface at
+    // startup, not when the first request arrives.
+    let (config, issues) = match Config::load(Path::new(&config_path)) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("localserver: {e}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
+
+    // Non-fatal issues: these servers were dropped, the rest still run.
+    for issue in &issues {
+        if issue.line > 0 {
+            eprintln!("localserver: warning: {config_path}:{}: {}", issue.line, issue.message);
+        } else {
+            eprintln!("localserver: warning: {}", issue.message);
+        }
+    }
+    if !issues.is_empty() {
+        eprintln!(
+            "localserver: {} server block(s) skipped, {} still configured",
+            issues.len(),
+            config.servers.len()
+        );
+    }
+
+    print_summary(&config);
+
+    // TASKS.md 2.x: bind the listeners and enter the event loop.
+    eprintln!("localserver: event loop not implemented yet (TASKS.md phase 2)");
     ExitCode::SUCCESS
+}
+
+/// Print what was actually loaded, so a config change can be confirmed without
+/// sending a request. Useful during the audit's configuration questions.
+fn print_summary(config: &Config) {
+    println!("Loaded {} server block(s):", config.servers.len());
+    for (host, port) in config.listeners() {
+        let servers = config.servers_on(&host, port);
+        println!("  listener {host}:{port} — {} server(s)", servers.len());
+        for server in servers {
+            let names = if server.server_names.is_empty() {
+                "(no server_names)".to_string()
+            } else {
+                server.server_names.join(", ")
+            };
+            let flag = if server.is_default { " [default]" } else { "" };
+            println!(
+                "    {names}{flag}  body limit {} bytes, {} route(s)",
+                server.client_max_body_size,
+                server.routes.len()
+            );
+            for route in &server.routes {
+                let methods: Vec<&str> = route.methods.iter().map(|m| m.as_str()).collect();
+                let mut detail = format!("{} -> {}", route.path, route.root.display());
+                if let Some(r) = &route.redirect {
+                    detail = format!("{} -> {} {}", route.path, r.status, r.target);
+                }
+                if !route.cgi.is_empty() {
+                    let exts: Vec<&str> = route.cgi.keys().map(|s| s.as_str()).collect();
+                    detail.push_str(&format!(" (cgi: {})", exts.join(", ")));
+                }
+                if route.autoindex {
+                    detail.push_str(" (autoindex)");
+                }
+                println!("      [{}] {detail}", methods.join(","));
+            }
+        }
+    }
 }

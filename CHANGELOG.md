@@ -21,6 +21,72 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 1.1 — configuration data model** (`src/config/mod.rs`): `Config`,
+  `ServerConfig`, `RouteConfig`, `Redirect`, `Method`, plus `Config::load` tying
+  parse, path resolution and validation together, and `ConfigError` for the
+  three ways loading can fail (unreadable / syntax / semantic).
+  _Why:_ the struct fields are a one-to-one transcription of the subject's
+  "Configuration File" bullet list. Anything missing from the model is a feature
+  the config cannot express, and the auditor tests each bullet separately
+  (`[A-9]`..`[A-16]`).
+
+- **Phase 1.2 — hand-written YAML-subset parser** (`src/config/parser.rs`):
+  nested mappings, block sequences, sequences of mappings, `#` comments, quoted
+  scalars with escapes, and `K`/`M`/`G` size suffixes. Two passes — text to a
+  generic `Yaml` tree, then tree to the typed `Config`.
+  _Why:_ keeps the dependency set at `mio` + `libc`, and every error carries the
+  line it occurred on. The two-pass split keeps syntax errors ("expected
+  `key: value`") distinguishable from schema errors ("unknown key
+  `serevr_names`"), which is the difference between a diagnosable config mistake
+  and a mysterious one.
+
+- **Unsupported syntax is rejected by name, not mis-parsed.** Tabs, flow-style
+  collections (`[a, b]`), unknown keys, unknown methods and duplicate keys are
+  all errors that name the supported alternative.
+  _Why:_ a config that is silently read differently from how it was written is
+  the worst possible outcome — the server looks broken while the file looks
+  fine. `ports: [8080]` now says "write a block list instead" rather than
+  failing later with "`[8080]` is not a valid port number".
+
+- **Relative paths resolve against the config file's directory,** not the
+  process working directory.
+  _Why:_ `localserver /etc/localserver/config.yaml` must work from any working
+  directory; resolving against the cwd would make the same config behave
+  differently depending on where it was started.
+
+- **Phase 1.3 — startup validation** (`src/config/validate.rs`) with two
+  severities: `Fatal` (listener conflicts — refuse to start) and `Skip` (one
+  broken server block — drop it, keep the others). Per-server checks run first;
+  conflict detection then runs over the survivors only.
+  _Why:_ this is the whole of `[A-30]` and `[A-31]`, which pull in opposite
+  directions. A duplicate port is unresolvable — the server cannot guess which
+  block wins — so it must fail loudly at startup rather than at `bind()` time in
+  production. A missing document root affects only its own server, so it must
+  not take down the others. The ordering matters for the same reason: a server
+  already dropped will never bind a socket, so it cannot conflict with anything,
+  and checking it would turn one broken block into a fatal error.
+
+- **Same `host:port` with distinct `server_names` is explicitly allowed,** and
+  covered by its own test.
+  _Why:_ that is ordinary virtual hosting (`[A-11]`), not a conflict. Without a
+  test pinning it, an over-eager duplicate-port check would look correct while
+  breaking the vhost requirement.
+
+- **Phase 1.4 — 41 unit tests** across parser and validation: node shapes,
+  comment and quote handling, size and boolean spellings, every error path with
+  its expected line number, all four fatal conflict shapes, ten skip conditions,
+  and the Skip/Fatal boundary.
+  _Why:_ required by `[A-35]` and `[A-37]`. Two are regression tests against the
+  shipped `config.yaml` itself, so a syntax the parser cannot handle cannot be
+  introduced into the real file unnoticed.
+
+- **`main.rs` loads and prints the configuration** — listeners, virtual hosts,
+  body limits and routes — and exits 2 on an unusable config.
+  _Why:_ makes a config change confirmable without sending a request, which is
+  most of what the audit's configuration section asks for. The distinct exit code
+  lets a test script tell "bad config" from any other failure.
+
+
 - **Phase 0.1 — Cargo project and module tree.** `cargo init --name localserver`
   (edition 2021) with `mio 1.2` (`os-poll`, `net`) and `libc 0.2` as the only
   dependencies. Created `src/config/{mod,parser,validate}.rs`, `src/server.rs`,
@@ -126,8 +192,10 @@ numbering in `TASKS.md`.
 
 ### Notes
 
-- No request handling yet: the modules are documented stubs. `cargo build` is
-  clean and `cargo test` runs 0 tests, which is the stated Phase 0 exit criterion.
+- No request handling yet: the remaining modules are documented stubs.
+  `cargo build` is clean and `cargo test` runs 41 passing tests.
+- Not yet done in the config area: `Method::Put`/`Options` parse but no handler
+  implements them, and `matches_name` is written against Phase 4's router.
 - Toolchain: `rustc` / `cargo` 1.97.1. Resolved dependencies: `mio 1.2.3`,
   `libc 0.2.189` (`log 0.4.34` arrives transitively via `mio`).
 - `siege` is not installed on the development machine; required before Phase 9

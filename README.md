@@ -10,8 +10,17 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phase 0 complete: project skeleton and scaffolding. The module tree builds and
-`cargo test` runs. No request handling yet — see `TASKS.md` for what lands next.
+Phases 0 and 1 complete: skeleton, scaffolding, configuration parsing and
+startup validation, with 41 passing tests. No request handling yet — the event
+loop is Phase 2 of `TASKS.md`.
+
+Running the binary today loads and prints the configuration, which is enough to
+check a config edit:
+
+```bash
+cargo run -- config.yaml     # prints listeners, virtual hosts, routes
+echo $?                      # 2 if the configuration is unusable
+```
 
 ## Build and run
 
@@ -30,7 +39,8 @@ Then open <http://127.0.0.1:8080/>.
 | Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. Level-triggered registration re-reports the remainder. |
 | Blocking | Nothing blocks. Partial requests and partial responses live in per-connection buffers across loop iterations; CGI stdin/stdout are `O_NONBLOCK` pipes registered in the same `Poll`. |
 | Crash safety | No `unwrap`/`expect` on the request path, `SIGPIPE` ignored, per-connection `catch_unwind` as a last resort. A client error drops that client, never the server. |
-| Config | Hand-written YAML-subset parser, validated at startup. Dependencies stay at `mio` + `libc`. |
+| Config | Hand-written YAML-subset parser, validated at startup. Dependencies stay at `mio` + `libc`. Unsupported syntax is rejected by name rather than mis-parsed. |
+| Config errors | Two severities. A **listener conflict** (same `host:port` claimed twice) is unresolvable and refuses startup. A **broken server block** (missing root, unreadable error page) is dropped with a warning while the other servers keep serving. |
 
 ### Module map
 
