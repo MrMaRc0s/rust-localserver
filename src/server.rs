@@ -37,6 +37,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::io;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -46,7 +47,7 @@ use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
-use crate::config::Config;
+use crate::config::{Config, ServerConfig};
 use crate::connection::{Action, Connection, Timeout};
 
 /// Listener tokens occupy `[0, CONNECTION_TOKEN_BASE)`, connection tokens start
@@ -77,6 +78,12 @@ struct Listener {
     host: String,
     port: u16,
     token: Token,
+    /// Servers sharing this address, in declaration order. Shared with every
+    /// connection accepted here so the router can pick one by `Host`.
+    ///
+    /// `Rc` rather than `Arc`: there is exactly one thread, so atomic
+    /// refcounting would be paid for and never used.
+    servers: Rc<Vec<ServerConfig>>,
     /// The largest body any server sharing this listener accepts.
     ///
     /// Which virtual host a request belongs to is not known until its `Host`
@@ -150,13 +157,21 @@ impl Server {
                 failures.push(format!("{host}:{port}: register: {e}"));
                 continue;
             }
-            let max_body = config
-                .servers_on(&host, port)
+            let servers: Vec<ServerConfig> =
+                config.servers_on(&host, port).into_iter().cloned().collect();
+            let max_body = servers
                 .iter()
                 .map(|s| s.client_max_body_size)
                 .max()
                 .unwrap_or(crate::config::DEFAULT_MAX_BODY);
-            listeners.push(Listener { socket, host, port, token, max_body });
+            listeners.push(Listener {
+                socket,
+                host,
+                port,
+                token,
+                servers: Rc::new(servers),
+                max_body,
+            });
         }
 
         for failure in &failures {
@@ -232,6 +247,7 @@ impl Server {
             }
 
             let max_body = self.listeners[index].max_body;
+            let servers = Rc::clone(&self.listeners[index].servers);
             let (socket, peer) = match self.listeners[index].socket.accept() {
                 Ok(pair) => pair,
                 // Backlog drained: the normal way out of this loop.
@@ -248,11 +264,17 @@ impl Server {
                 }
             };
 
-            self.register_connection(socket, peer, max_body);
+            self.register_connection(socket, peer, max_body, servers);
         }
     }
 
-    fn register_connection(&mut self, mut socket: TcpStream, peer: SocketAddr, max_body: usize) {
+    fn register_connection(
+        &mut self,
+        mut socket: TcpStream,
+        peer: SocketAddr,
+        max_body: usize,
+        servers: Rc<Vec<ServerConfig>>,
+    ) {
         // Small responses should leave immediately rather than waiting for
         // Nagle to coalesce them with data that will never come.
         if let Err(e) = socket.set_nodelay(true) {
@@ -273,7 +295,7 @@ impl Server {
         }
 
         self.connections
-            .insert(token, Connection::new(socket, peer, token, max_body));
+            .insert(token, Connection::new(socket, peer, token, max_body, servers));
         self.accepted += 1;
     }
 
@@ -298,11 +320,11 @@ impl Server {
             if action == Action::Keep && event.is_writable() {
                 action = connection.on_writable();
             }
-            Some((action, connection.desired_interest()))
+            Some((action, connection.desired_interest(), connection.take_rearm()))
         }));
 
-        let (action, interest) = match outcome {
-            Ok(Some(pair)) => pair,
+        let (action, interest, rearm) = match outcome {
+            Ok(Some(triple)) => triple,
             Ok(None) => return,
             Err(_) => {
                 eprintln!("localserver: panic while handling {token:?}, dropping the client");
@@ -313,17 +335,24 @@ impl Server {
 
         match action {
             Action::Close => self.close(token),
-            Action::Keep => self.sync_interest(token, interest),
+            Action::Keep => self.sync_interest(token, interest, rearm),
         }
     }
 
-    /// Re-register only when the connection now waits for something different.
-    fn sync_interest(&mut self, token: Token, interest: Interest) {
+    /// Re-register when the connection now waits for something different, or
+    /// when it must be re-armed.
+    ///
+    /// `mio` registers descriptors edge-triggered, so a socket that still holds
+    /// data after a single read will not be reported again on its own.
+    /// `EPOLL_CTL_MOD` re-reports readiness on an edge-triggered descriptor,
+    /// which is what lets this server keep to one read per event instead of
+    /// draining each client until it blocks ([A-5]).
+    fn sync_interest(&mut self, token: Token, interest: Interest, rearm: bool) {
         let connection = match self.connections.get_mut(&token) {
             Some(c) => c,
             None => return,
         };
-        if connection.registered == interest {
+        if connection.registered == interest && !rearm {
             return;
         }
         match self
@@ -449,7 +478,7 @@ impl Server {
                         Some(c) => c.desired_interest(),
                         None => continue,
                     };
-                    self.sync_interest(token, interest);
+                    self.sync_interest(token, interest, false);
                 }
             }
         }

@@ -9,9 +9,24 @@
 //! Draining one client until it blocks would let a single fast uploader (or a
 //! slow-loris dribbling bytes) hold the thread while every other client waits —
 //! with one thread there is nobody else to serve them. One syscall per readiness
-//! event gives fair round-robin service instead. Nothing is lost by stopping
-//! early: the sockets are registered level-triggered, so if data remains the
-//! next `poll()` reports the connection ready again immediately.
+//! event gives fair round-robin service instead.
+//!
+//! ## Re-arming, and why it is needed
+//!
+//! `mio` registers descriptors **edge-triggered** (`EPOLLET`). Edge-triggered
+//! epoll reports a socket once when data arrives and stays silent afterwards,
+//! which normally forces the "read until `WouldBlock`" loop this design
+//! deliberately avoids: stop after one read and the bytes already sitting in
+//! the socket buffer would never be announced again. A large upload deadlocks —
+//! the server waits for an event that will not come while the client waits for
+//! the server to drain the window.
+//!
+//! The fix is to re-arm rather than to drain. When a read fills the whole
+//! buffer — meaning more may be pending — [`Connection::take_rearm`] tells the
+//! server to re-register the socket. `epoll_ctl(EPOLL_CTL_MOD)` on an
+//! edge-triggered descriptor re-reports readiness if data is still available,
+//! so the next `poll()` returns this connection again. One read per event is
+//! preserved, and every client still gets its turn in between.
 //!
 //! # The error rule ([A-6], [A-7])
 //!
@@ -47,9 +62,12 @@ use std::time::{Duration, Instant};
 use mio::net::TcpStream;
 use mio::{Interest, Token};
 
-use crate::config::Method;
+use std::rc::Rc;
+
+use crate::config::{Method, ServerConfig};
 use crate::http::request::{Progress, Request, RequestParser};
 use crate::http::response::Response;
+use crate::router::{self, Resolution};
 
 /// Bytes requested per `read()`. One syscall moves at most this much.
 const READ_CHUNK: usize = 16 * 1024;
@@ -171,6 +189,15 @@ pub struct Connection {
     keep_alive: bool,
     /// A `100 Continue` has already been sent for the request in progress.
     sent_continue: bool,
+    /// Servers sharing the listener this connection arrived on; the router
+    /// picks between them by `Host`.
+    servers: Rc<Vec<ServerConfig>>,
+    /// The virtual host's body limit has been applied to the parser.
+    limit_narrowed: bool,
+    /// The last read filled the buffer, so the socket may hold more. Because
+    /// the registration is edge-triggered, it has to be re-armed for that data
+    /// to be reported again.
+    rearm: bool,
     created_at: Instant,
     last_activity: Instant,
     /// Requests answered on this connection; keep-alive reuse is visible here.
@@ -181,7 +208,13 @@ impl Connection {
     /// `max_body` is the largest body any server on this listener accepts. The
     /// selected virtual host's own, stricter limit is applied once the `Host`
     /// header has been read (TASKS.md 4.1).
-    pub fn new(socket: TcpStream, peer: SocketAddr, token: Token, max_body: usize) -> Connection {
+    pub fn new(
+        socket: TcpStream,
+        peer: SocketAddr,
+        token: Token,
+        max_body: usize,
+        servers: Rc<Vec<ServerConfig>>,
+    ) -> Connection {
         let now = Instant::now();
         Connection {
             socket,
@@ -195,6 +228,9 @@ impl Connection {
             after_write: AfterWrite::Close,
             keep_alive: true,
             sent_continue: false,
+            servers,
+            limit_narrowed: false,
+            rearm: false,
             created_at: now,
             last_activity: now,
             requests: 0,
@@ -222,10 +258,21 @@ impl Connection {
     /// request split across many reads is its problem, not this one's.
     fn read_once(&mut self, chunk: &mut [u8]) -> IoOutcome {
         let outcome = classify_read(self.socket.read(chunk));
-        if let IoOutcome::Progress(_) = outcome {
+        if let IoOutcome::Progress(n) = outcome {
             self.last_activity = Instant::now();
+            // A short read means the socket buffer is empty and a fresh edge
+            // will arrive with the next data. A full one means there may be
+            // more waiting, which an edge-triggered registration will not
+            // announce again unless it is re-armed.
+            self.rearm = n == chunk.len();
         }
         outcome
+    }
+
+    /// Whether the socket must be re-registered to surface data the last read
+    /// left behind. Clears the flag.
+    pub fn take_rearm(&mut self) -> bool {
+        std::mem::replace(&mut self.rearm, false)
     }
 
     /// Exactly one `write()` syscall. No loop.
@@ -306,6 +353,26 @@ impl Connection {
             Progress::NeedMore => {
                 if self.parser.headers_ready() {
                     self.state = State::ReadingBody;
+                    // The listener's limit is the most permissive among the
+                    // servers sharing it. Now that Host is known, apply the
+                    // selected server's own, stricter one ([A-13]).
+                    if !self.limit_narrowed {
+                        self.limit_narrowed = true;
+                        let host = self.parser.head().and_then(|h| h.host());
+                        if let Some(server) =
+                            router::select_server(&self.servers, host.as_deref())
+                        {
+                            self.parser.set_max_body(server.client_max_body_size);
+                        }
+                        // Re-run the parser: the narrower limit may already be
+                        // exceeded by what has arrived.
+                        if let Progress::Failed(status) = self.parser.feed(&[]) {
+                            self.keep_alive = false;
+                            let bytes = error_response(status).to_bytes(false);
+                            self.queue(bytes, AfterWrite::Close);
+                            return Action::Keep;
+                        }
+                    }
                     // A client that announced `Expect: 100-continue` is waiting
                     // for permission before sending its body. Without the
                     // interim response it stalls for a second and then sends
@@ -328,9 +395,10 @@ impl Connection {
                     None => return Action::Close,
                 };
                 self.sent_continue = false;
+                self.limit_narrowed = false;
                 self.keep_alive = request.wants_keep_alive();
                 self.requests += 1;
-                let response = respond(&request);
+                let response = respond(&self.servers, &request);
                 let bytes = response.to_bytes(self.keep_alive);
                 let next = if self.keep_alive { AfterWrite::NextRequest } else { AfterWrite::Close };
                 self.queue(bytes, next);
@@ -361,6 +429,7 @@ impl Connection {
     /// Response fully flushed and the connection is being kept alive: start
     /// over. Buffers are cleared rather than reallocated.
     fn reset_for_next_request(&mut self) {
+        self.limit_narrowed = false;
         self.write_buf.clear();
         self.write_pos = 0;
         self.state = State::ReadingHeaders;
@@ -413,39 +482,78 @@ impl Connection {
 
 /// Build the response for a parsed request.
 ///
-/// Phase 3 stops here: the request is fully parsed and the status is chosen
-/// correctly, but nothing is served from disk yet. TASKS.md 4.x replaces this
-/// with virtual host selection and route matching, 5.x with the handlers.
-fn respond(request: &Request) -> Response {
-    let method = match request.method_enum() {
-        Some(m) => m,
-        // Well-formed but unimplemented: 501, not 400. The request is valid,
-        // this server just does not do that.
-        None => return error_response(501),
+/// Phase 4 selects the virtual host and resolves the route; the handlers that
+/// actually read files, write uploads and run scripts are TASKS.md phase 5 and
+/// 7. Everything the router decides on its own — redirects, 405 with `Allow`,
+/// 403, 404, 501 — is already final here.
+fn respond(servers: &[ServerConfig], request: &Request) -> Response {
+    let host = request.host();
+    let server = match router::select_server(servers, host.as_deref()) {
+        Some(server) => server,
+        // A listener always has at least one server, so this cannot happen; if
+        // it somehow does, it is a server-side fault, not the client's.
+        None => return error_response(500),
     };
 
-    let summary = format!(
-        "LocalServer\n\
-         method:  {}\n\
-         path:    {}\n\
-         query:   {}\n\
-         version: {}\n\
-         host:    {}\n\
-         headers: {}\n\
-         body:    {} bytes\n",
-        request.method,
-        request.path,
-        if request.query.is_empty() { "-" } else { &request.query },
-        request.version.as_str(),
-        request.host().unwrap_or_else(|| "-".to_string()),
-        request.headers.len(),
-        request.body.len(),
-    );
+    let head_only = request.method_enum() == Some(Method::Head);
 
-    Response::with_body(200, "text/plain; charset=utf-8", summary.into_bytes())
-        // A HEAD response reports the length a GET would have returned, but
-        // sends no body.
-        .head_only(method == Method::Head)
+    match router::resolve(server, request) {
+        Resolution::Redirect { status, location } => Response::html(
+            status,
+            format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><title>{status}</title></head>\
+                 <body><p>Moved to <a href=\"{location}\">{location}</a></p></body></html>\n"
+            ),
+        )
+        .header("Location", &location)
+        .head_only(head_only),
+
+        // RFC 9110 requires Allow on a 405, so the client learns what it may
+        // use instead of guessing.
+        Resolution::MethodNotAllowed { allow } => {
+            error_response(405).header("Allow", &allow)
+        }
+
+        Resolution::Error(status) => error_response(status),
+
+        // Resolved successfully; the handler that performs the work lands in a
+        // later phase. Reporting the decision keeps routing verifiable now.
+        other => {
+            let plan = match &other {
+                Resolution::File { path } => format!("serve file {}", path.display()),
+                Resolution::Listing { path, url_path } => {
+                    format!("list directory {} at {url_path}", path.display())
+                }
+                Resolution::Cgi { interpreter, script, path_info } => format!(
+                    "run {} {} (PATH_INFO {:?})",
+                    interpreter.display(),
+                    script.display(),
+                    path_info
+                ),
+                Resolution::Upload { dir } => format!("store upload in {}", dir.display()),
+                Resolution::Delete { path } => format!("delete {}", path.display()),
+                _ => String::new(),
+            };
+            let body = format!(
+                "LocalServer\n\
+                 server:  {}\n\
+                 method:  {}\n\
+                 path:    {}\n\
+                 plan:    {plan}\n\
+                 body:    {} bytes\n",
+                if server.server_names.is_empty() {
+                    "(default)".to_string()
+                } else {
+                    server.server_names.join(", ")
+                },
+                request.method,
+                request.path,
+                request.body.len(),
+            );
+            Response::with_body(200, "text/plain; charset=utf-8", body.into_bytes())
+                .head_only(head_only)
+        }
+    }
 }
 
 /// A minimal error response.
@@ -501,41 +609,6 @@ mod tests {
     #[test]
     fn zero_length_write_is_an_error_not_progress() {
         assert!(matches!(classify_write(Ok(0)), IoOutcome::Failed(_)));
-    }
-
-    #[test]
-    fn an_unknown_method_is_not_implemented_rather_than_bad() {
-        let mut parser = RequestParser::new(1024);
-        assert_eq!(parser.feed(b"BREW /pot HTTP/1.1\r\nHost: x\r\n\r\n"), Progress::Complete);
-        let request = parser.take().unwrap();
-        // The request is well formed; the server just does not implement it.
-        assert!(request.method_enum().is_none());
-        assert_eq!(respond(&request).status, 501);
-    }
-
-    #[test]
-    fn a_parsed_request_is_summarised_with_status_200() {
-        let mut parser = RequestParser::new(1024);
-        parser.feed(b"GET /a/b?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n");
-        let request = parser.take().unwrap();
-        let response = respond(&request);
-        assert_eq!(response.status, 200);
-        let text = String::from_utf8_lossy(&response.body).to_string();
-        assert!(text.contains("path:    /a/b"), "{text}");
-        assert!(text.contains("query:   x=1"), "{text}");
-        assert!(text.contains("host:    example.com"), "{text}");
-    }
-
-    #[test]
-    fn head_requests_get_a_length_but_no_body() {
-        let mut parser = RequestParser::new(1024);
-        parser.feed(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
-        let request = parser.take().unwrap();
-        let bytes = respond(&request).to_bytes(true);
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("Content-Length: "));
-        assert!(!text.contains("Content-Length: 0\r\n"), "length is the body a GET would send");
-        assert!(text.ends_with("\r\n\r\n"), "no body follows the headers");
     }
 
     #[test]

@@ -10,14 +10,15 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phases 0–3 complete: configuration, the event loop, and full HTTP/1.1 message
-parsing (headers, `Content-Length` and chunked bodies, multipart uploads) with
-correct status codes. 117 passing tests, clean under
+Phases 0–4 complete: configuration, the event loop, HTTP/1.1 message parsing,
+and routing — virtual hosts, longest-prefix routes, per-route methods,
+redirects, directory rules and traversal defence. 152 passing tests, clean under
 `cargo clippy --all-targets`.
 
-Nothing is served from disk yet — routing is Phase 4 and the handlers are
-Phase 5 of `TASKS.md`. A valid request currently returns a summary of what was
-parsed.
+Nothing is read from or written to disk yet — the handlers are Phase 5 of
+`TASKS.md`. A request that resolves to a file, listing, upload or script
+currently returns a summary of the routing decision; redirects, 405, 403, 404
+and 501 are already final.
 
 ```bash
 cargo run --release -- config.yaml   # binds 8080, 8081, 8082
@@ -26,7 +27,7 @@ echo $?                              # 2 if the configuration is unusable
 ```
 
 Measured with `siege -b -t20S http://127.0.0.1:8080/`: **100.00% availability**
-over 26,958 transactions, 0 failed, file descriptors back to baseline
+over 23,910 transactions, 0 failed, file descriptors back to baseline
 afterwards.
 
 ## Build and run
@@ -43,8 +44,10 @@ Then open <http://127.0.0.1:8080/>.
 | Concern | Approach |
 |---|---|
 | Concurrency | One process, one thread, one `mio::Poll`. Listeners, client sockets and CGI pipes are all tokens in the same `epoll`. |
-| Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. Level-triggered registration re-reports the remainder. |
+| Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. `mio` is edge-triggered, so a socket that may still hold data is **re-armed** with `EPOLL_CTL_MOD` rather than drained in a loop. |
 | Blocking | Nothing blocks. Partial requests and partial responses live in per-connection buffers across loop iterations; CGI stdin/stdout are `O_NONBLOCK` pipes registered in the same `Poll`. |
+| Routing | `Host` selects the virtual host; routes match by longest prefix at segment boundaries. Order is fixed: redirect, method (405 with `Allow`), path sanitising, CGI, directory rules, file. A directory with no index and no autoindex is 403, not 404 — it exists, it just may not be enumerated. |
+| Traversal | Percent-decode, then normalise `..`, then `canonicalize` to catch symlinks out of the root. Decoding first is what makes `%2e%2e%2f` visible to the normaliser. |
 | Parsing | Incremental and restartable: `NeedMore` / `Complete` / `Failed(status)`. "Incomplete" is never treated as an error, which is what lets one-read-per-event coexist with correct parsing. Ambiguous body framing (`Content-Length` **and** `Transfer-Encoding`, or conflicting duplicates) is refused rather than guessed. |
 | Crash safety | `unwrap`/`expect` **denied by lint** on the request path, `SIGPIPE` ignored, per-connection `catch_unwind` as a last resort, `EINTR` from `poll()` retried. A client error drops that client, never the server. |
 | Timeouts | Two deadlines per connection: 30 s idle and 60 s total. A partial request gets 408; an idle keep-alive connection closes silently, because an expiring connection slot is not an error. |

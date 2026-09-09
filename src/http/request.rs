@@ -53,6 +53,8 @@ pub enum Version {
 }
 
 impl Version {
+    // Becomes SERVER_PROTOCOL in the CGI environment (TASKS.md 7.2).
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Version::Http10 => "HTTP/1.0",
@@ -113,6 +115,7 @@ impl Headers {
         self.entries.iter().map(|(n, v)| (n.as_str(), v.as_str()))
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -316,6 +319,14 @@ impl RequestParser {
                     BodyKind::None => self.phase = Phase::Done,
 
                     BodyKind::Length(total) => {
+                        // Re-checked here, not only when the headers were
+                        // parsed: `set_max_body` may have narrowed the limit to
+                        // the selected virtual host's since then, and a body
+                        // that was acceptable to the listener may be too large
+                        // for the server actually answering ([A-13]).
+                        if total > self.max_body {
+                            return Progress::Failed(413);
+                        }
                         let needed = total - self.body.len();
                         let take = needed.min(self.buf.len());
                         self.body.extend(self.buf.drain(..take));
@@ -841,6 +852,17 @@ mod tests {
         parser.feed(b"POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
         assert!(parser.headers_ready());
         assert!(parser.head().unwrap().expects_continue());
+    }
+
+    /// A declared length is re-checked against a limit narrowed after the
+    /// headers, not just against the listener's more permissive one.
+    #[test]
+    fn narrowing_the_limit_rejects_an_already_declared_oversized_body() {
+        let mut parser = RequestParser::new(1_000_000);
+        let progress = parser.feed(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 700000\r\n\r\n");
+        assert_eq!(progress, Progress::NeedMore, "accepted under the listener's limit");
+        parser.set_max_body(512 * 1024);
+        assert_eq!(parser.feed(b"data"), Progress::Failed(413));
     }
 
     /// The virtual host's stricter limit can be applied once the headers are in.

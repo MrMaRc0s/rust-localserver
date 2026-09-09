@@ -21,6 +21,100 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 4.1 — virtual host selection** (`src/router.rs`): `Host` (port
+  stripped, lowercased) matched against `server_names`, falling back to the
+  `is_default` server for that address and then to the first declared.
+  _Why:_ `[A-11]`. Verified live on one socket: `curl http://127.0.0.1:8080/`
+  serves `www/index.html` while
+  `curl --resolve test.com:8080:127.0.0.1 http://test.com:8080/` serves
+  `www/site2/index.html`. An unmatched `Host` falls back rather than erroring,
+  which is what makes a plain IP request work at all.
+
+- **Phase 4.2 — longest-prefix route matching** with a deliberate resolution
+  order: redirect, then method, then path sanitising, then CGI, then directory
+  rules, then file.
+  _Why:_ the audit asks about this order. A **redirect wins over the method
+  check** because the route is not serving the resource — `/old-page` redirects
+  whether or not the file exists and whatever the method. **405 precedes 404**
+  because whether the resource exists is not the question being answered, and
+  revealing existence to a client that may not use that method leaks
+  information. **CGI precedes the directory rules** so a script is executed
+  rather than offered as a download. A prefix only matches at a segment
+  boundary, so `/upload` cannot capture `/uploads` and serve it from the wrong
+  root.
+
+- **`Allow` header on every 405**, listing the route's configured methods.
+  _Why:_ required by RFC 9110, and `[A-16]` tests DELETE with and without
+  permission. `config.yaml` ships `/uploads` (GET, POST, DELETE) and
+  `/readonly` (GET) over the same directory, so the pair is a two-command
+  demonstration: `DELETE /readonly/x` answers `405` with `Allow: GET`.
+
+- **Directory rules**: configured `index` if present, else a listing when
+  `autoindex` is on, else **403 rather than 404**.
+  _Why:_ `[A-15]`. The directory does exist — the client is simply not allowed
+  to enumerate it, and 404 would be a lie.
+
+- **301 redirect for a directory requested without a trailing slash**,
+  preserving the query string.
+  _Why:_ without it every relative link on the served page resolves one level
+  too high, so browsing a nested directory breaks in a real browser while
+  looking fine under `curl`.
+
+- **`PATH_INFO` splitting for CGI**: the first path segment whose extension is
+  registered becomes the script, everything after it is `PATH_INFO`.
+  _Why:_ the subject requires `PATH_INFO`. Resolving the whole URL to one file
+  instead would 404 on `/cgi-bin/app.py/users/7`, which is a legitimate CGI
+  request.
+
+- **Phase 4.3 — path sanitising** (`src/utils/path.rs`): percent-decode, reject
+  `%00`, normalise `.`/`..`, then verify with `canonicalize` that the result is
+  still under the route root.
+  _Why:_ the order is the whole point. A normaliser that runs **before**
+  decoding never sees the `..` hidden in `%2e%2e%2f`. `canonicalize` cannot be
+  the only defence because it fails outright on a path that does not exist, so a
+  traversal aimed at a missing file would skip the check entirely; lexical
+  normalisation makes the path safe before the filesystem is consulted, and
+  `canonicalize` then catches what lexical work cannot — a **symlink inside the
+  root pointing outside it**, which has its own test. `%00` is refused because a
+  NUL truncates the path inside a syscall, so the validator and the kernel would
+  disagree about which file is meant.
+
+- **Phase 4.4 — 35 new tests**: virtual host selection and fallback, longest
+  prefix, segment-boundary matching, the full resolution order, 405 with
+  `Allow`, index/autoindex/403, trailing-slash redirect, CGI extension and
+  `PATH_INFO`, traversal in three encodings, symlink escape, upload and delete
+  resolution. 152 tests in total.
+
+### Fixed
+
+- **Large request bodies deadlocked the connection.** `mio` registers
+  descriptors **edge-triggered** (`EPOLLET`), which reports a socket once when
+  data arrives and stays silent afterwards. With one read per event the bytes
+  already sitting in the socket buffer were never announced again: the server
+  waited for an event that would not come while the client waited for its window
+  to drain. Small requests hid it completely — every test up to Phase 3 fitted
+  in a single 16 KB read.
+  _Why the fix is re-arming rather than draining:_ the obvious repair is to read
+  until `WouldBlock`, which is exactly the behaviour `[A-5]` asks about and this
+  design rejects — one client could then monopolise the single thread. Instead,
+  when a read fills the buffer the connection asks the server to re-register it;
+  `epoll_ctl(EPOLL_CTL_MOD)` on an edge-triggered descriptor re-reports
+  readiness if data remains, so the next `poll()` returns this connection again.
+  One read per event is preserved and every other client still gets its turn in
+  between.
+
+- **A declared `Content-Length` was only checked against the listener's limit,**
+  never against the stricter one applied after the virtual host was known: a
+  700 KB body reached a server configured for 512 KB and was answered by the
+  router instead of being refused.
+  _Why:_ `set_max_body` narrows the limit once `Host` has been read, but the
+  length check only ran while parsing headers. It is now re-checked as the body
+  is consumed, so `[A-13]` behaves the same for both framings — verified live:
+  700 KB to `test.com` (512 KB limit) answers 413 whether sent with a
+  `Content-Length` or chunked, while the same body to `localhost` (1 MB) is
+  accepted.
+
+
 - **Phase 3.1 — incremental request parser** (`src/http/request.rs`): request
   line, headers (case-insensitive, order-preserving, repeat-aware), version,
   and a `Headers::has_token` for comma-separated list headers. Reports
@@ -381,15 +475,19 @@ numbering in `TASKS.md`.
 
 ### Notes
 
-- Requests are now fully parsed and answered with the correct status, but
-  **nothing is served from disk yet**: a successful request gets a plain-text
-  summary of what was parsed. Virtual host selection and route matching are
-  Phase 4; the static-file, upload, delete and autoindex handlers are Phase 5.
+- Routing is complete, but **nothing is read from or written to disk yet**: a
+  request that resolves to a file, listing, upload, delete or CGI gets a
+  plain-text summary of the decision instead. The handlers that perform the work
+  are Phase 5 (and Phase 7 for CGI). Everything the router decides on its own —
+  redirects, 405 with `Allow`, 403, 404, 501 — is already final.
+- **Gap worth closing:** the edge-triggered deadlock fixed this phase is
+  invisible to unit tests, which never touch a socket. Until the integration
+  suite in Phase 9.1 exists there is no automated guard against it returning; it
+  was caught by hand with a 700 KB POST.
 - `cargo build`, `cargo build --release` and `cargo clippy --all-targets` are
   clean; `cargo test` runs 117 passing tests.
-- **siege, 20 s, default 25 users, against the canned response**: 26,958
-  transactions, **100.00% availability**, 0 failed, 1315 trans/sec, 0.02 s mean
-  response. File descriptors returned to the 7-descriptor baseline and no
+- **siege, 20 s, default 25 users, against the routed canned response**: 23,910
+  transactions, **100.00% availability**, 0 failed, 1136 trans/sec. File descriptors returned to the 7-descriptor baseline and no
   `CLOSE_WAIT` sockets remained. The 99.5% target in `[A-32]` is met, though it
   must be re-measured once the filesystem is in the path.
 - Not yet done: `Method::Put`/`Options` parse but no handler implements them.
