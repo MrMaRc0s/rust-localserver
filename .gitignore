@@ -1,0 +1,48 @@
+# ---- Rust / Cargo ----
+/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock is intentionally committed: this crate builds a binary,
+# so reproducible builds for the audit depend on the locked versions.
+
+# ---- Server runtime output ----
+# Uploaded files are user data, not source. Keep the directory, drop contents.
+/uploads/*
+!/uploads/.gitkeep
+/www/uploads/*
+!/www/uploads/.gitkeep
+
+# Logs, pids and metrics dumps produced by a running server
+*.log
+logs/
+*.pid
+/metrics/
+
+# Local config overrides (config.yaml itself IS committed)
+config.local.yaml
+config.*.local.yaml
+
+# ---- Test / profiling artifacts ----
+siege.log
+/siege_results/
+vgcore.*
+valgrind-out.*
+perf.data*
+*.profraw
+callgrind.out.*
+massif.out.*
+
+# ---- CGI build output ----
+/cgi-bin/**/*.o
+/cgi-bin/**/*.out
+__pycache__/
+*.py[cod]
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
