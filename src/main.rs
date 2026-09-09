@@ -68,8 +68,22 @@ fn main() -> ExitCode {
 
     print_summary(&config);
 
-    // TASKS.md 2.x: bind the listeners and enter the event loop.
-    eprintln!("localserver: event loop not implemented yet (TASKS.md phase 2)");
+    // Bind first: a port already in use must be reported now, not silently.
+    let mut server = match server::Server::bind(config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("localserver: {e}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
+
+    // `run` returns only if the poll itself fails, which is not recoverable:
+    // without readiness notifications the process cannot serve anyone. Every
+    // per-client failure is handled inside the loop and never reaches here.
+    if let Err(e) = server.run() {
+        eprintln!("localserver: event loop stopped: {e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 

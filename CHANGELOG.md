@@ -21,6 +21,95 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 2.1/2.2 — the event loop** (`src/server.rs`): one `mio::Poll`, one
+  `Events` buffer, one connection map. Listener tokens occupy
+  `[0, 1<<20)` and connection tokens start above it, so dispatch is a single
+  comparison. `poll()` is called with a 500 ms tick.
+  _Why:_ `epoll` over `select` because `select` is O(watched fds) per call,
+  rebuilds its fd sets every time, and cannot watch a descriptor above
+  `FD_SETSIZE` (1024) — which a server under `siege` reaches. **One** instance
+  rather than several because with two, a descriptor could become ready in the
+  first while the thread is blocked in the second's `wait()`; the only escapes
+  are spinning or a second thread, and the subject allows neither
+  (`[A-2]`..`[A-4]`). The tick is what lets timeouts be enforced when no traffic
+  arrives at all.
+
+- **Phase 2.3 — accept loop** that drains the backlog until `WouldBlock`, sets
+  `TCP_NODELAY`, and registers each client as `READABLE`.
+  _Why:_ this is the one place a drain loop is correct — every `accept()`
+  returns a *different* descriptor, so looping serves many clients rather than
+  favouring one. It is not the "one read per client" rule, which is about a
+  single client's socket. A failing `accept` (EMFILE, ECONNABORTED) logs and
+  returns instead of propagating: existing clients are unaffected (`[A-20]`).
+
+- **Connection ceiling with listener throttling** (512 connections): at capacity
+  the listeners are deregistered from the poll and re-registered when a
+  connection closes.
+  _Why:_ without a ceiling, fd exhaustion makes `accept` fail with `EMFILE`
+  while the listener stays readable — the loop then spins at 100% CPU retrying a
+  call that cannot succeed. Deregistering parks new connections in the kernel
+  backlog, which is what a backlog is for.
+
+- **Phase 2.4 — exactly one `read()` or one `write()` per client per event**
+  (`src/connection.rs`), with the interest re-registered on every state change
+  and never set to both directions at once.
+  _Why:_ `[A-5]` asks this literally. Draining one client until `WouldBlock`
+  lets a fast uploader or a slow-loris hold the single thread while everyone
+  else waits. One syscall per event is fair round-robin, and level-triggered
+  registration re-reports the remainder on the next `poll()`, so stopping early
+  loses nothing.
+
+- **Phase 2.5 — `classify_read` / `classify_write`**, collapsing every I/O
+  return value into `Progress` / `PeerClosed` / `WouldBlock` / `Failed`.
+  _Why:_ `[A-6]` and `[A-7]`. The distinction that matters is that `WouldBlock`
+  and `Interrupted` are **not** errors — dropping a client because its socket
+  had nothing to give is the classic bug in this project, and there is a test
+  named for it. The two classifiers differ deliberately: `Ok(0)` from a read is
+  end-of-stream, but `Ok(0)` from a write means the socket accepted nothing
+  while claiming to be writable, which would spin the loop if treated as
+  progress, so it is reported as a failure.
+
+- **Phase 2.6 — two deadlines per connection**: idle (30 s without bytes moving)
+  and total request duration (60 s), swept every loop iteration. A partial
+  request gets a 408; an idle keep-alive connection is closed silently.
+  _Why:_ `[A-34]`. A client that sends `GET / HTTP/1.1\r\n` and stops would
+  otherwise hold a descriptor forever. The silent close for an idle keep-alive
+  is deliberate: an unused connection slot expiring is normal, not an error, and
+  answering 408 to a client that is not mid-request would be wrong. Verified
+  live: 408 after 30.1 s, quiet close after 29.8 s.
+
+- **Phase 2.7 — never crash.** `SIGPIPE` ignored at startup, per-connection
+  handling wrapped in `catch_unwind`, `#![deny(clippy::unwrap_used,
+  clippy::expect_used)]` on `server.rs` and `connection.rs`, and `EINTR` from
+  `poll()` treated as "poll again" rather than fatal.
+  _Why:_ `SIGPIPE` specifically because a browser closing a tab mid-response
+  makes the next write raise it, and its default action **terminates the
+  process** — the server would die on entirely normal client behaviour. The
+  `catch_unwind` turns a logic bug into one dropped client instead of a dead
+  server. The lint denial makes the "no panics on the request path" rule
+  enforced rather than merely intended.
+
+- **Graceful bind failures**: a listener that cannot bind is reported and
+  skipped; startup fails only if none bound.
+  _Why:_ same reasoning as the Skip severity in config validation (`[A-31]`) —
+  one unusable port should not deny service on the others. Confirmed
+  accidentally during testing when a stray instance held the ports: three
+  warnings, then a clean exit 2.
+
+### Changed
+
+- `main.rs` now binds the listeners and enters the event loop after printing the
+  configuration summary.
+  _Why:_ `run()` returns only when `poll()` itself fails, which is genuinely
+  unrecoverable — without readiness notification the process cannot serve
+  anyone. Every per-client failure is handled inside the loop and never reaches
+  `main`.
+
+- Collapsed two nested conditionals and a `len() > 0` flagged by clippy.
+  _Why:_ `cargo clippy --all-targets` is now warning-free, so a future real
+  finding will not be lost in existing noise.
+
+
 - **Phase 1.1 — configuration data model** (`src/config/mod.rs`): `Config`,
   `ServerConfig`, `RouteConfig`, `Redirect`, `Method`, plus `Config::load` tying
   parse, path resolution and validation together, and `ConfigError` for the
@@ -192,10 +281,20 @@ numbering in `TASKS.md`.
 
 ### Notes
 
-- No request handling yet: the remaining modules are documented stubs.
-  `cargo build` is clean and `cargo test` runs 41 passing tests.
-- Not yet done in the config area: `Method::Put`/`Options` parse but no handler
-  implements them, and `matches_name` is written against Phase 4's router.
+- The server now accepts connections and answers, but the reply is a **canned
+  200** — `connection.rs` scans for the end of the header block and does not yet
+  parse anything. Requests that should be 400 currently answer 200; the real
+  parser is Phase 3, the router Phase 4. An oversized header block is already
+  refused with 431 rather than buffered without bound.
+- `cargo build` and `cargo clippy --all-targets` are clean; `cargo test` runs 49
+  passing tests.
+- Measured on this machine, canned response, no parsing: 2000 requests over 50
+  concurrent keep-alive connections in 0.37 s (~5400 req/s), 100% success, file
+  descriptors back to the 7-descriptor baseline afterwards, no `CLOSE_WAIT`
+  sockets left behind. 300 sequential `Connection: close` requests: same result.
+- Not yet done: `Method::Put`/`Options` parse but no handler implements them;
+  `matches_name`, `Connection::state` and `Connection::token` are written
+  against Phases 4, 7 and 8 and are `#[allow(dead_code)]` until then.
 - Toolchain: `rustc` / `cargo` 1.97.1. Resolved dependencies: `mio 1.2.3`,
   `libc 0.2.189` (`log 0.4.34` arrives transitively via `mio`).
 - `siege` is not installed on the development machine; required before Phase 9

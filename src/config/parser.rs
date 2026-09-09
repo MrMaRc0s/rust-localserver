@@ -94,10 +94,10 @@ fn strip_comment(s: &str) -> &str {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             b'\\' if in_double => i += 1,
-            b'#' if !in_single && !in_double => {
-                if i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t' {
-                    return &s[..i];
-                }
+            // A `#` only starts a comment at the start of the line or after
+            // whitespace, so `host/#frag` keeps its fragment.
+            b'#' if !in_single && !in_double && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t') => {
+                return &s[..i];
             }
             _ => {}
         }
@@ -804,7 +804,7 @@ servers:
         assert_eq!(redirect.status, 301);
         assert_eq!(redirect.target, "/new");
         // A redirect route needs no root, and never reads one.
-        assert!(old.root.as_os_str().len() > 0);
+        assert!(!old.root.as_os_str().is_empty());
     }
 
     #[test]

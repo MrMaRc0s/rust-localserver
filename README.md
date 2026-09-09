@@ -10,16 +10,17 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phases 0 and 1 complete: skeleton, scaffolding, configuration parsing and
-startup validation, with 41 passing tests. No request handling yet — the event
-loop is Phase 2 of `TASKS.md`.
+Phases 0–2 complete: configuration, and a working single-threaded event loop
+that accepts connections, enforces timeouts and never blocks. 49 passing tests,
+clean under `cargo clippy --all-targets`.
 
-Running the binary today loads and prints the configuration, which is enough to
-check a config edit:
+The reply is still a canned `200` — HTTP parsing is Phase 3 and routing is
+Phase 4 of `TASKS.md`.
 
 ```bash
-cargo run -- config.yaml     # prints listeners, virtual hosts, routes
-echo $?                      # 2 if the configuration is unusable
+cargo run --release -- config.yaml   # binds 8080, 8081, 8082
+curl -i http://127.0.0.1:8080/
+echo $?                              # 2 if the configuration is unusable
 ```
 
 ## Build and run
@@ -38,7 +39,9 @@ Then open <http://127.0.0.1:8080/>.
 | Concurrency | One process, one thread, one `mio::Poll`. Listeners, client sockets and CGI pipes are all tokens in the same `epoll`. |
 | Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. Level-triggered registration re-reports the remainder. |
 | Blocking | Nothing blocks. Partial requests and partial responses live in per-connection buffers across loop iterations; CGI stdin/stdout are `O_NONBLOCK` pipes registered in the same `Poll`. |
-| Crash safety | No `unwrap`/`expect` on the request path, `SIGPIPE` ignored, per-connection `catch_unwind` as a last resort. A client error drops that client, never the server. |
+| Crash safety | `unwrap`/`expect` **denied by lint** on the request path, `SIGPIPE` ignored, per-connection `catch_unwind` as a last resort, `EINTR` from `poll()` retried. A client error drops that client, never the server. |
+| Timeouts | Two deadlines per connection: 30 s idle and 60 s total. A partial request gets 408; an idle keep-alive connection closes silently, because an expiring connection slot is not an error. |
+| Backpressure | At 512 connections the listeners leave the poll, so new clients wait in the kernel backlog instead of spinning the loop on an `accept` that cannot succeed. |
 | Config | Hand-written YAML-subset parser, validated at startup. Dependencies stay at `mio` + `libc`. Unsupported syntax is rejected by name rather than mis-parsed. |
 | Config errors | Two severities. A **listener conflict** (same `host:port` claimed twice) is unresolvable and refuses startup. A **broken server block** (missing root, unreadable error page) is dropped with a warning while the other servers keep serving. |
 
