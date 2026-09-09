@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocalServer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <img src="/static/logo.png" alt="LocalServer logo">
+    <div>
+      <h1>LocalServer</h1>
+      <p class="lead">Single thread, single epoll, no async runtime.</p>
+    </div>
+  </header>
+
+  <p>If you are reading this in a browser, the static file path works: request
+  parsing, routing, MIME detection and <code>Content-Length</code> are all
+  behaving. The stylesheet and the image above are separate requests &mdash;
+  check the network panel to confirm they were served over a reused
+  keep-alive connection.</p>
+
+  <h2>Try these</h2>
+  <ul>
+    <li><a href="/listing/">/listing/</a> &mdash; directory listing (autoindex)</li>
+    <li><a href="/uploads/">/uploads/</a> &mdash; upload target, GET/POST/DELETE</li>
+    <li><a href="/readonly/">/readonly/</a> &mdash; same files, DELETE returns 405</li>
+    <li><a href="/old-page">/old-page</a> &mdash; 301 redirect back here</li>
+    <li><a href="/cgi-bin/hello.py">/cgi-bin/hello.py</a> &mdash; CGI</li>
+    <li><a href="/no-such-page">/no-such-page</a> &mdash; custom 404 page</li>
+    <li><a href="/empty.html">/empty.html</a> &mdash; empty page used for siege</li>
+  </ul>
+
+  <h2>Virtual hosts</h2>
+  <p>This server and a second site share port 8080, distinguished by the
+  <code>Host</code> header:</p>
+  <pre>curl --resolve test.com:8080:127.0.0.1 http://test.com:8080/</pre>
+
+  <footer>LocalServer &mdash; Zone01 <code>rust-localserver</code></footer>
+</main>
+</body>
+</html>

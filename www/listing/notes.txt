@@ -1,0 +1,1 @@
+Sample text file served from an autoindexed directory.

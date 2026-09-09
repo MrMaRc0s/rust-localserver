@@ -9,8 +9,6 @@
 # Uploaded files are user data, not source. Keep the directory, drop contents.
 /uploads/*
 !/uploads/.gitkeep
-/www/uploads/*
-!/www/uploads/.gitkeep
 
 # Logs, pids and metrics dumps produced by a running server
 *.log

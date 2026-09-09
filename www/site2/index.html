@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>test.com — virtual host</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>test.com</h1>
+      <p class="lead">A different site on the same IP and port.</p>
+    </div>
+  </header>
+  <p>You reached this page because the <code>Host</code> header said
+  <code>test.com</code>. The same socket on <code>127.0.0.1:8080</code> serves
+  the main site when the header says <code>localhost</code>. Two server blocks,
+  one listener &mdash; not a port conflict.</p>
+  <pre>curl --resolve test.com:8080:127.0.0.1 http://test.com:8080/</pre>
+  <footer>LocalServer &mdash; virtual host demo</footer>
+</main>
+</body>
+</html>

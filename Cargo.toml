@@ -1,0 +1,22 @@
+[package]
+name = "localserver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["sntentop"]
+description = "A single-threaded, non-blocking HTTP/1.1 server built on epoll via mio"
+readme = "README.md"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Non-blocking I/O readiness only (epoll wrapper). No async runtime, no executor.
+mio = { version = "1", features = ["os-poll", "net"] }
+# Raw syscalls mio does not expose: fcntl(O_NONBLOCK) on CGI pipes, waitpid, signal.
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"   # NOT "abort": the catch_unwind safety net in server.rs needs unwinding.
