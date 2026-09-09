@@ -47,13 +47,12 @@ use std::time::{Duration, Instant};
 use mio::net::TcpStream;
 use mio::{Interest, Token};
 
+use crate::config::Method;
+use crate::http::request::{Progress, Request, RequestParser};
+use crate::http::response::Response;
+
 /// Bytes requested per `read()`. One syscall moves at most this much.
 const READ_CHUNK: usize = 16 * 1024;
-
-/// Cap on a request header block. Beyond this the request is refused rather
-/// than buffered indefinitely — an unbounded header is a memory-exhaustion
-/// vector, and no legitimate client needs more.
-const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// No bytes moved for this long: the connection is idle.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -122,12 +121,22 @@ pub fn classify_write(result: io::Result<usize>) -> IoOutcome {
 pub enum State {
     /// Accumulating bytes until the end of the header block.
     ReadingHeaders,
-    /// Header block parsed; accumulating the body. Entered by the request
-    /// parser in TASKS.md 3.2.
-    #[allow(dead_code)]
+    /// Header block parsed; accumulating the body.
     ReadingBody,
     /// A response is queued; flushing it.
     Writing,
+}
+
+/// What to do once the queued bytes have been flushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterWrite {
+    /// Response complete and the connection is not being reused.
+    Close,
+    /// Response complete; start reading the next request (keep-alive).
+    NextRequest,
+    /// That was an interim `100 Continue`; go back to reading this request's
+    /// body. The response proper has not been sent yet.
+    ResumeBody,
 }
 
 /// Why a connection has run out of time.
@@ -152,14 +161,16 @@ pub struct Connection {
     /// a `reregister` syscall when nothing changed.
     pub registered: Interest,
     state: State,
-    read_buf: Vec<u8>,
+    /// Owns the bytes received but not yet consumed, so a request split across
+    /// many reads survives between events.
+    parser: RequestParser,
     write_buf: Vec<u8>,
     /// How much of `write_buf` has been handed to the kernel so far.
     write_pos: usize,
-    /// Close once the queued response has been flushed (`Connection: close`,
-    /// or an error response that ends the conversation).
-    close_after_write: bool,
+    after_write: AfterWrite,
     keep_alive: bool,
+    /// A `100 Continue` has already been sent for the request in progress.
+    sent_continue: bool,
     created_at: Instant,
     last_activity: Instant,
     /// Requests answered on this connection; keep-alive reuse is visible here.
@@ -167,7 +178,10 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(socket: TcpStream, peer: SocketAddr, token: Token) -> Connection {
+    /// `max_body` is the largest body any server on this listener accepts. The
+    /// selected virtual host's own, stricter limit is applied once the `Host`
+    /// header has been read (TASKS.md 4.1).
+    pub fn new(socket: TcpStream, peer: SocketAddr, token: Token, max_body: usize) -> Connection {
         let now = Instant::now();
         Connection {
             socket,
@@ -175,11 +189,12 @@ impl Connection {
             token,
             registered: Interest::READABLE,
             state: State::ReadingHeaders,
-            read_buf: Vec::with_capacity(READ_CHUNK),
+            parser: RequestParser::new(max_body),
             write_buf: Vec::new(),
             write_pos: 0,
-            close_after_write: false,
+            after_write: AfterWrite::Close,
             keep_alive: true,
+            sent_continue: false,
             created_at: now,
             last_activity: now,
             requests: 0,
@@ -202,11 +217,12 @@ impl Connection {
     }
 
     /// Exactly one `read()` syscall. No loop.
-    fn read_once(&mut self) -> IoOutcome {
-        let mut chunk = [0u8; READ_CHUNK];
-        let outcome = classify_read(self.socket.read(&mut chunk));
-        if let IoOutcome::Progress(n) = outcome {
-            self.read_buf.extend_from_slice(&chunk[..n]);
+    ///
+    /// The bytes go straight into the parser, which owns the buffering: a
+    /// request split across many reads is its problem, not this one's.
+    fn read_once(&mut self, chunk: &mut [u8]) -> IoOutcome {
+        let outcome = classify_read(self.socket.read(chunk));
+        if let IoOutcome::Progress(_) = outcome {
             self.last_activity = Instant::now();
         }
         outcome
@@ -229,8 +245,9 @@ impl Connection {
     /// Handle one readable event: one read, then advance the state machine over
     /// whatever is now buffered.
     pub fn on_readable(&mut self) -> Action {
-        match self.read_once() {
-            IoOutcome::Progress(_) => self.advance(),
+        let mut chunk = [0u8; READ_CHUNK];
+        match self.read_once(&mut chunk) {
+            IoOutcome::Progress(n) => self.process(&chunk[..n]),
             // The peer closed. If a response is still queued we cannot deliver
             // it, so there is nothing to do but drop the connection.
             IoOutcome::PeerClosed => Action::Close,
@@ -251,11 +268,23 @@ impl Connection {
                     // Partially flushed; the next writable event continues.
                     return Action::Keep;
                 }
-                if self.close_after_write || !self.keep_alive {
-                    Action::Close
-                } else {
-                    self.reset_for_next_request();
-                    Action::Keep
+                match self.after_write {
+                    AfterWrite::Close => Action::Close,
+                    AfterWrite::NextRequest if !self.keep_alive => Action::Close,
+                    AfterWrite::NextRequest => {
+                        self.reset_for_next_request();
+                        // A pipelined request may already be buffered: drive the
+                        // parser over it now rather than waiting for a read that
+                        // may never come.
+                        self.process(&[])
+                    }
+                    AfterWrite::ResumeBody => {
+                        // The 100 Continue is out; carry on receiving the body.
+                        self.write_buf.clear();
+                        self.write_pos = 0;
+                        self.state = State::ReadingBody;
+                        self.process(&[])
+                    }
                 }
             }
             IoOutcome::WouldBlock => Action::Keep,
@@ -267,48 +296,78 @@ impl Connection {
         }
     }
 
-    /// Advance after new bytes arrived.
+    /// Drive the parser over `input` (which may be empty, to re-run it over
+    /// bytes already buffered) and act on what it concludes.
     ///
-    /// Phase 3 replaces the header scan and the canned reply with the real
-    /// parser and router; the surrounding I/O contract does not change.
-    fn advance(&mut self) -> Action {
-        if self.state != State::ReadingHeaders {
-            return Action::Keep;
-        }
-        if find_header_end(&self.read_buf).is_none() {
-            if self.read_buf.len() > MAX_HEADER_BYTES {
-                // Refuse rather than buffer without bound.
-                self.queue_response(placeholder_error(431, "Request Header Fields Too Large"));
-                self.close_after_write = true;
-                return Action::Keep;
+    /// The three-way split is the point of the parser's design: "incomplete" is
+    /// not an error, and must not close a client on a slow link.
+    fn process(&mut self, input: &[u8]) -> Action {
+        match self.parser.feed(input) {
+            Progress::NeedMore => {
+                if self.parser.headers_ready() {
+                    self.state = State::ReadingBody;
+                    // A client that announced `Expect: 100-continue` is waiting
+                    // for permission before sending its body. Without the
+                    // interim response it stalls for a second and then sends
+                    // anyway, which would tax every upload.
+                    if !self.sent_continue
+                        && self.parser.head().map(|h| h.expects_continue()).unwrap_or(false)
+                    {
+                        self.sent_continue = true;
+                        self.queue(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec(), AfterWrite::ResumeBody);
+                    }
+                }
+                Action::Keep
             }
-            // Incomplete: wait for the next readable event.
-            return Action::Keep;
-        }
 
-        self.keep_alive = wants_keep_alive(&self.read_buf);
-        self.requests += 1;
-        let response = placeholder_ok(self.keep_alive);
-        self.queue_response(response);
-        Action::Keep
+            Progress::Complete => {
+                let request = match self.parser.take() {
+                    Some(r) => r,
+                    // Cannot happen: Complete means a request is ready. Closing
+                    // is the safe response to an impossible state.
+                    None => return Action::Close,
+                };
+                self.sent_continue = false;
+                self.keep_alive = request.wants_keep_alive();
+                self.requests += 1;
+                let response = respond(&request);
+                let bytes = response.to_bytes(self.keep_alive);
+                let next = if self.keep_alive { AfterWrite::NextRequest } else { AfterWrite::Close };
+                self.queue(bytes, next);
+                Action::Keep
+            }
+
+            Progress::Failed(status) => {
+                // A malformed request leaves the byte stream in an unknown
+                // state: there is no way to find where the next request would
+                // begin, so the connection ends after the error response.
+                self.keep_alive = false;
+                let response = error_response(status);
+                let bytes = response.to_bytes(false);
+                self.queue(bytes, AfterWrite::Close);
+                Action::Keep
+            }
+        }
     }
 
-    /// Queue a response and switch to writing.
-    fn queue_response(&mut self, bytes: Vec<u8>) {
+    /// Queue bytes for sending and switch to writing.
+    fn queue(&mut self, bytes: Vec<u8>, after: AfterWrite) {
         self.write_buf = bytes;
         self.write_pos = 0;
+        self.after_write = after;
         self.state = State::Writing;
     }
 
     /// Response fully flushed and the connection is being kept alive: start
     /// over. Buffers are cleared rather than reallocated.
     fn reset_for_next_request(&mut self) {
-        self.read_buf.clear();
         self.write_buf.clear();
         self.write_pos = 0;
         self.state = State::ReadingHeaders;
-        self.close_after_write = false;
+        self.after_write = AfterWrite::Close;
+        self.sent_continue = false;
         self.last_activity = Instant::now();
+        // The parser keeps any pipelined bytes it has already received.
     }
 
     /// Deadline check, run on every loop tick.
@@ -328,11 +387,13 @@ impl Connection {
     /// slot: close it quietly, that is not an error. One that sent a partial
     /// request gets a 408 so the client learns why, then closes.
     pub fn on_idle_timeout(&mut self) -> Action {
+        let mid_request = self.parser.headers_ready() || self.parser.buffered() > 0;
         match self.state {
-            State::ReadingHeaders | State::ReadingBody if self.read_buf.is_empty() => Action::Close,
+            State::ReadingHeaders | State::ReadingBody if !mid_request => Action::Close,
             State::ReadingHeaders | State::ReadingBody => {
-                self.queue_response(placeholder_error(408, "Request Timeout"));
-                self.close_after_write = true;
+                let bytes = error_response(408).to_bytes(false);
+                self.keep_alive = false;
+                self.queue(bytes, AfterWrite::Close);
                 // Give the 408 its own window to flush instead of being
                 // immediately re-reaped by the next sweep.
                 self.last_activity = Instant::now();
@@ -350,60 +411,56 @@ impl Connection {
     }
 }
 
-/// Index just past the `\r\n\r\n` that ends a header block.
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Cheap scan for `Connection: close`. Phase 3 replaces this with the parsed
-/// header map; HTTP/1.1 defaults to keep-alive.
-fn wants_keep_alive(buf: &[u8]) -> bool {
-    let head = match find_header_end(buf) {
-        Some(end) => &buf[..end],
-        None => buf,
+/// Build the response for a parsed request.
+///
+/// Phase 3 stops here: the request is fully parsed and the status is chosen
+/// correctly, but nothing is served from disk yet. TASKS.md 4.x replaces this
+/// with virtual host selection and route matching, 5.x with the handlers.
+fn respond(request: &Request) -> Response {
+    let method = match request.method_enum() {
+        Some(m) => m,
+        // Well-formed but unimplemented: 501, not 400. The request is valid,
+        // this server just does not do that.
+        None => return error_response(501),
     };
-    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
-    // HTTP/1.0 defaults to closing after each response unless it explicitly
-    // asks to keep the connection; HTTP/1.1 is the other way round.
-    if text.contains("http/1.0") && !text.contains("connection: keep-alive") {
-        return false;
-    }
-    !text.contains("connection: close")
+
+    let summary = format!(
+        "LocalServer\n\
+         method:  {}\n\
+         path:    {}\n\
+         query:   {}\n\
+         version: {}\n\
+         host:    {}\n\
+         headers: {}\n\
+         body:    {} bytes\n",
+        request.method,
+        request.path,
+        if request.query.is_empty() { "-" } else { &request.query },
+        request.version.as_str(),
+        request.host().unwrap_or_else(|| "-".to_string()),
+        request.headers.len(),
+        request.body.len(),
+    );
+
+    Response::with_body(200, "text/plain; charset=utf-8", summary.into_bytes())
+        // A HEAD response reports the length a GET would have returned, but
+        // sends no body.
+        .head_only(method == Method::Head)
 }
 
-/// Placeholder 200, replaced in Phase 3 by the router and response builder.
-fn placeholder_ok(keep_alive: bool) -> Vec<u8> {
-    let body = b"LocalServer: event loop online.\n";
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let mut out = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Server: localserver\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: {connection}\r\n\
-         \r\n",
-        body.len()
-    )
-    .into_bytes();
-    out.extend_from_slice(body);
-    out
-}
-
-/// Placeholder error response, replaced in Phase 5.5 by the configured pages.
-fn placeholder_error(status: u16, reason: &str) -> Vec<u8> {
-    let body = format!("{status} {reason}\n");
-    let mut out = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Server: localserver\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        body.len()
-    )
-    .into_bytes();
-    out.extend_from_slice(body.as_bytes());
-    out
+/// A minimal error response.
+///
+/// Replaced in TASKS.md 5.5 by the pages configured per server; this is the
+/// built-in fallback that must always work, since an error page that itself
+/// fails would recurse.
+fn error_response(status: u16) -> Response {
+    let reason = crate::http::response::reason_phrase(status);
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <title>{status} {reason}</title></head>\
+         <body><h1>{status} {reason}</h1></body></html>\n"
+    );
+    Response::html(status, body).header("Connection", "close")
 }
 
 #[cfg(test)]
@@ -447,33 +504,46 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_end_of_a_header_block() {
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\nHost: x\r\n"), None);
-        // Body bytes after the terminator do not move the boundary.
-        assert_eq!(find_header_end(b"A\r\n\r\nBODY"), Some(5));
+    fn an_unknown_method_is_not_implemented_rather_than_bad() {
+        let mut parser = RequestParser::new(1024);
+        assert_eq!(parser.feed(b"BREW /pot HTTP/1.1\r\nHost: x\r\n\r\n"), Progress::Complete);
+        let request = parser.take().unwrap();
+        // The request is well formed; the server just does not implement it.
+        assert!(request.method_enum().is_none());
+        assert_eq!(respond(&request).status, 501);
     }
 
     #[test]
-    fn detects_connection_close() {
-        assert!(wants_keep_alive(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
-        assert!(!wants_keep_alive(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n"));
-        // Header names and values are case-insensitive.
-        assert!(!wants_keep_alive(b"GET / HTTP/1.1\r\nCONNECTION: CLOSE\r\n\r\n"));
-        // HTTP/1.0 defaults to close unless it asks for keep-alive.
-        assert!(!wants_keep_alive(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n"));
-        assert!(wants_keep_alive(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"));
+    fn a_parsed_request_is_summarised_with_status_200() {
+        let mut parser = RequestParser::new(1024);
+        parser.feed(b"GET /a/b?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let request = parser.take().unwrap();
+        let response = respond(&request);
+        assert_eq!(response.status, 200);
+        let text = String::from_utf8_lossy(&response.body).to_string();
+        assert!(text.contains("path:    /a/b"), "{text}");
+        assert!(text.contains("query:   x=1"), "{text}");
+        assert!(text.contains("host:    example.com"), "{text}");
     }
 
     #[test]
-    fn placeholder_responses_are_well_formed() {
-        let ok = placeholder_ok(true);
-        let text = String::from_utf8_lossy(&ok);
-        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("Content-Length: 32\r\n"));
-        assert!(text.contains("Connection: keep-alive\r\n"));
-        // Header block is properly terminated and the body follows it.
-        let end = find_header_end(&ok).unwrap();
-        assert_eq!(ok.len() - end, 32);
+    fn head_requests_get_a_length_but_no_body() {
+        let mut parser = RequestParser::new(1024);
+        parser.feed(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let request = parser.take().unwrap();
+        let bytes = respond(&request).to_bytes(true);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Content-Length: "));
+        assert!(!text.contains("Content-Length: 0\r\n"), "length is the body a GET would send");
+        assert!(text.ends_with("\r\n\r\n"), "no body follows the headers");
+    }
+
+    #[test]
+    fn error_responses_close_the_connection() {
+        let response = error_response(400);
+        assert_eq!(response.status, 400);
+        assert_eq!(response.get_header("Connection"), Some("close"));
+        let text = String::from_utf8_lossy(&response.to_bytes(false)).to_string();
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
     }
 }

@@ -21,6 +21,106 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 3.1 — incremental request parser** (`src/http/request.rs`): request
+  line, headers (case-insensitive, order-preserving, repeat-aware), version,
+  and a `Headers::has_token` for comma-separated list headers. Reports
+  `NeedMore` / `Complete` / `Failed(status)`.
+  _Why:_ the loop reads once per event, so a request arrives in arbitrary
+  fragments — a header split mid-word, a body dribbled a byte at a time. Keeping
+  **incomplete** distinct from **invalid** is what lets one-read-per-event
+  (`[A-5]`) and correct parsing (`[A-36]`) coexist; treating a short read as an
+  error would break every client on a slow link. There is a test that feeds a
+  whole request one byte at a time.
+
+- **Rejections beyond plain syntax errors**, each with the status the audit
+  expects: `Content-Length` together with `Transfer-Encoding` → 400, conflicting
+  duplicate `Content-Length` → 400, whitespace before a header colon → 400,
+  obsolete line folding → 400, missing or repeated `Host` on HTTP/1.1 → 400,
+  unknown version → 505, unimplemented transfer coding → 501, over-long header
+  block → 431, over-long request line → 414.
+  _Why:_ the first two are the classic request-smuggling setup — two framings on
+  one request, where servers that disagree about where the body ends can be made
+  to see different requests. The rest are cases where a lenient parser and a
+  strict one disagree, which is exactly where security bugs live. 505 rather
+  than 400 for `HTTP/2.0`, and 501 rather than 400 for an unknown method,
+  because those requests are well-formed — the server simply does not implement
+  them.
+
+- **Phase 3.2 — chunked codec** (`src/http/chunked.rs`): incremental decoder
+  (size line, data, trailers, chunk extensions ignored) and an encoder for
+  responses of unknown length.
+  _Why:_ `[A-28]` asks about both directions. A chunked body cannot announce its
+  size up front, so `client_max_body_size` has to be enforced **while decoding**
+  rather than checked beforehand — a declared `Content-Length` over the limit is
+  refused before a single body byte is buffered, which is the difference between
+  answering 413 and buffering a 2 GB upload first. Tested by splitting the same
+  stream at every possible byte position and checking all decode identically.
+
+- **Phase 3.3 — multipart/form-data parser** (`src/http/multipart.rs`) with
+  filename sanitising.
+  _Why:_ `[A-21]` uploads a file and downloads it again to check it was not
+  corrupted. Parts are located by byte search and copied verbatim — nothing
+  converts a body to a `String`. The CRLF before a boundary belongs to the
+  delimiter, not the file; getting that wrong appends two stray bytes to every
+  upload and is invisible on text files but corrupts every binary one, so there
+  is a test with NULs, high bytes and embedded CRLF. `sanitize_filename` keeps
+  only the final path component and refuses `..`, hidden files and control
+  characters outright rather than trying to rewrite them.
+
+- **Phase 3.4 — response builder** (`src/http/response.rs`) always emitting
+  `Content-Length` (or honouring `Transfer-Encoding`), `Date`, `Server` and an
+  explicit `Connection`, with `HEAD` support that keeps the length but drops the
+  body.
+  _Why:_ `[A-24]`. A browser is far less forgiving than `curl`: a missing or
+  wrong `Content-Length` makes it hang waiting for bytes that never arrive,
+  which reads at the audit as a broken server.
+
+- **RFC 9110 `Date` formatting from scratch**, using Howard Hinnant's
+  `civil_from_days`.
+  _Why:_ no date crate is needed for a dozen lines of arithmetic, and the
+  IMF-fixdate format is fixed by the spec rather than locale-dependent. Verified
+  against the specification's own example (`Sun, 06 Nov 1994 08:49:37 GMT`) plus
+  leap days and the 400-year century rule.
+
+- **`Expect: 100-continue` handling** via a new `AfterWrite::ResumeBody` state:
+  the interim response is queued and flushed through the normal writable path,
+  then reading resumes.
+  _Why:_ a client that announces the expectation waits a second before sending
+  its body anyway, taxing every upload. Handling it through the event loop's
+  own write path rather than an opportunistic direct `write` keeps the rule that
+  all I/O goes through epoll (`[A-8]`) intact.
+
+- **Pipelined request handling**: after a response is flushed the parser is
+  re-driven over bytes already buffered.
+  _Why:_ a client may send two requests in one packet. Waiting for another read
+  that never comes would stall it until the idle timeout.
+
+- **Phase 3.5 / MIME table** (`src/utils/mime.rs`), defaulting to
+  `application/octet-stream`.
+  _Why:_ guessing `text/plain` for unknown bytes makes a browser try to render
+  binary files and invites content sniffing.
+
+- **117 tests** (up from 49): 30 request-parser, 12 chunked, 10 response,
+  10 multipart, 6 MIME, plus the existing config and I/O ones.
+
+### Changed
+
+- `connection.rs` now drives the real parser instead of scanning for
+  `\r\n\r\n`, and builds responses with the response builder. Malformed
+  requests answer their true status instead of 200.
+  _Why:_ `[A-20]` is only genuinely satisfied once a wrong request produces a
+  wrong-request *status*, not merely a server that survives it. Verified live:
+  garbage → 400, `Host : x` → 400, missing `Host` → 400, `HTTP/2.0` → 505,
+  `BREW` → 501, 5000-byte body on the 1 KB port → 413.
+- `Connection::new` takes the listener's body limit; `server.rs` computes it per
+  listener as the maximum across the servers sharing that address.
+  _Why:_ which virtual host a request belongs to is unknown until its `Host`
+  header arrives, so the limit applied while reading is the most permissive one
+  on that address. `RequestParser::set_max_body` then narrows it to the selected
+  server in Phase 4. Using the maximum first is the safe direction: it never
+  rejects a request some virtual host would have allowed.
+
+
 - **Phase 2.1/2.2 — the event loop** (`src/server.rs`): one `mio::Poll`, one
   `Events` buffer, one connection map. Listener tokens occupy
   `[0, 1<<20)` and connection tokens start above it, so dispatch is a single
@@ -281,20 +381,21 @@ numbering in `TASKS.md`.
 
 ### Notes
 
-- The server now accepts connections and answers, but the reply is a **canned
-  200** — `connection.rs` scans for the end of the header block and does not yet
-  parse anything. Requests that should be 400 currently answer 200; the real
-  parser is Phase 3, the router Phase 4. An oversized header block is already
-  refused with 431 rather than buffered without bound.
-- `cargo build` and `cargo clippy --all-targets` are clean; `cargo test` runs 49
-  passing tests.
-- Measured on this machine, canned response, no parsing: 2000 requests over 50
-  concurrent keep-alive connections in 0.37 s (~5400 req/s), 100% success, file
-  descriptors back to the 7-descriptor baseline afterwards, no `CLOSE_WAIT`
-  sockets left behind. 300 sequential `Connection: close` requests: same result.
-- Not yet done: `Method::Put`/`Options` parse but no handler implements them;
-  `matches_name`, `Connection::state` and `Connection::token` are written
-  against Phases 4, 7 and 8 and are `#[allow(dead_code)]` until then.
+- Requests are now fully parsed and answered with the correct status, but
+  **nothing is served from disk yet**: a successful request gets a plain-text
+  summary of what was parsed. Virtual host selection and route matching are
+  Phase 4; the static-file, upload, delete and autoindex handlers are Phase 5.
+- `cargo build`, `cargo build --release` and `cargo clippy --all-targets` are
+  clean; `cargo test` runs 117 passing tests.
+- **siege, 20 s, default 25 users, against the canned response**: 26,958
+  transactions, **100.00% availability**, 0 failed, 1315 trans/sec, 0.02 s mean
+  response. File descriptors returned to the 7-descriptor baseline and no
+  `CLOSE_WAIT` sockets remained. The 99.5% target in `[A-32]` is met, though it
+  must be re-measured once the filesystem is in the path.
+- Not yet done: `Method::Put`/`Options` parse but no handler implements them.
+  The multipart parser and MIME table are written and tested but not yet called
+  (Phase 5), and are marked `#[allow(dead_code)]` with the task that consumes
+  them.
 - Toolchain: `rustc` / `cargo` 1.97.1. Resolved dependencies: `mio 1.2.3`,
   `libc 0.2.189` (`log 0.4.34` arrives transitively via `mio`).
 - `siege` is not installed on the development machine; required before Phase 9

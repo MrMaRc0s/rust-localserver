@@ -10,18 +10,24 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phases 0–2 complete: configuration, and a working single-threaded event loop
-that accepts connections, enforces timeouts and never blocks. 49 passing tests,
-clean under `cargo clippy --all-targets`.
+Phases 0–3 complete: configuration, the event loop, and full HTTP/1.1 message
+parsing (headers, `Content-Length` and chunked bodies, multipart uploads) with
+correct status codes. 117 passing tests, clean under
+`cargo clippy --all-targets`.
 
-The reply is still a canned `200` — HTTP parsing is Phase 3 and routing is
-Phase 4 of `TASKS.md`.
+Nothing is served from disk yet — routing is Phase 4 and the handlers are
+Phase 5 of `TASKS.md`. A valid request currently returns a summary of what was
+parsed.
 
 ```bash
 cargo run --release -- config.yaml   # binds 8080, 8081, 8082
 curl -i http://127.0.0.1:8080/
 echo $?                              # 2 if the configuration is unusable
 ```
+
+Measured with `siege -b -t20S http://127.0.0.1:8080/`: **100.00% availability**
+over 26,958 transactions, 0 failed, file descriptors back to baseline
+afterwards.
 
 ## Build and run
 
@@ -39,6 +45,7 @@ Then open <http://127.0.0.1:8080/>.
 | Concurrency | One process, one thread, one `mio::Poll`. Listeners, client sockets and CGI pipes are all tokens in the same `epoll`. |
 | Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. Level-triggered registration re-reports the remainder. |
 | Blocking | Nothing blocks. Partial requests and partial responses live in per-connection buffers across loop iterations; CGI stdin/stdout are `O_NONBLOCK` pipes registered in the same `Poll`. |
+| Parsing | Incremental and restartable: `NeedMore` / `Complete` / `Failed(status)`. "Incomplete" is never treated as an error, which is what lets one-read-per-event coexist with correct parsing. Ambiguous body framing (`Content-Length` **and** `Transfer-Encoding`, or conflicting duplicates) is refused rather than guessed. |
 | Crash safety | `unwrap`/`expect` **denied by lint** on the request path, `SIGPIPE` ignored, per-connection `catch_unwind` as a last resort, `EINTR` from `poll()` retried. A client error drops that client, never the server. |
 | Timeouts | Two deadlines per connection: 30 s idle and 60 s total. A partial request gets 408; an idle keep-alive connection closes silently, because an expiring connection slot is not an error. |
 | Backpressure | At 512 connections the listeners leave the poll, so new clients wait in the kernel backlog instead of spinning the loop on an `accept` that cannot succeed. |

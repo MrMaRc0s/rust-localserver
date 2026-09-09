@@ -77,6 +77,13 @@ struct Listener {
     host: String,
     port: u16,
     token: Token,
+    /// The largest body any server sharing this listener accepts.
+    ///
+    /// Which virtual host a request belongs to is not known until its `Host`
+    /// header arrives, so the limit applied while reading is the most
+    /// permissive one on this address; the selected server's own stricter limit
+    /// is applied as soon as the headers are parsed (TASKS.md 4.1).
+    max_body: usize,
 }
 
 pub struct Server {
@@ -143,7 +150,13 @@ impl Server {
                 failures.push(format!("{host}:{port}: register: {e}"));
                 continue;
             }
-            listeners.push(Listener { socket, host, port, token });
+            let max_body = config
+                .servers_on(&host, port)
+                .iter()
+                .map(|s| s.client_max_body_size)
+                .max()
+                .unwrap_or(crate::config::DEFAULT_MAX_BODY);
+            listeners.push(Listener { socket, host, port, token, max_body });
         }
 
         for failure in &failures {
@@ -218,6 +231,7 @@ impl Server {
                 return;
             }
 
+            let max_body = self.listeners[index].max_body;
             let (socket, peer) = match self.listeners[index].socket.accept() {
                 Ok(pair) => pair,
                 // Backlog drained: the normal way out of this loop.
@@ -234,11 +248,11 @@ impl Server {
                 }
             };
 
-            self.register_connection(socket, peer);
+            self.register_connection(socket, peer, max_body);
         }
     }
 
-    fn register_connection(&mut self, mut socket: TcpStream, peer: SocketAddr) {
+    fn register_connection(&mut self, mut socket: TcpStream, peer: SocketAddr, max_body: usize) {
         // Small responses should leave immediately rather than waiting for
         // Nagle to coalesce them with data that will never come.
         if let Err(e) = socket.set_nodelay(true) {
@@ -259,7 +273,7 @@ impl Server {
         }
 
         self.connections
-            .insert(token, Connection::new(socket, peer, token));
+            .insert(token, Connection::new(socket, peer, token, max_body));
         self.accepted += 1;
     }
 

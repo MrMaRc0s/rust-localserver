@@ -4,5 +4,6 @@
 //! Filled in by TASKS.md 3.x.
 
 pub mod chunked;
+pub mod multipart;
 pub mod request;
 pub mod response;
