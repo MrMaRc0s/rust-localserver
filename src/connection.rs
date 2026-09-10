@@ -873,6 +873,17 @@ fn route_request(
         None => return Routed::Reply(Reply::immediate(error::builtin(500))),
     };
 
+    // CORS preflight: browsers send `OPTIONS` with Access-Control-Request-*
+    // before non-simple cross-origin fetches (custom headers like X-Host,
+    // or Content-Type: application/octet-stream). Answer 204 with Allow so
+    // the visual audit dashboard can probe 8081/8082 from a page on 8080.
+    // `to_bytes` adds the Access-Control-Allow-* headers to every response.
+    if request.method_enum() == Some(Method::Options) {
+        return Routed::Reply(Reply::immediate(
+            Response::new(204).header("Allow", "GET, POST, DELETE, HEAD, OPTIONS"),
+        ));
+    }
+
     let head_only = request.method_enum() == Some(Method::Head);
 
     // Every handler returns `Result<Reply, u16>`, so a failure anywhere becomes

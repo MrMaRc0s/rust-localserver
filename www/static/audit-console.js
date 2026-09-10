@@ -199,6 +199,9 @@
     },
 
     // [A-11] Virtual hosts: test.com
+    // Browsers forbid setting `Host` from fetch, so the server honours
+    // `X-Host` as an alias (request.rs). Real audit uses:
+    //   curl --resolve test.com:8080:127.0.0.1 http://test.com:8080/
     async a11_vhost(box) {
       const start = performance.now();
       const res = await fetch('http://127.0.0.1:8080/', {
@@ -207,7 +210,7 @@
       const text = await res.text();
       const ok = res.status === 200 && (text.includes('test.com') || text.includes('site2'));
       renderCardResult(box, res.status, res.statusText, res.headers, text, performance.now() - start,
-        '[A-11] Host: test.com successfully routed to distinct site2 root on same port.', ok);
+        '[A-11] X-Host: test.com (alias for Host) routed to distinct site2 root on same port.', ok);
       return ok;
     },
 
@@ -235,16 +238,19 @@
     },
 
     // [A-13] Client Body Limit: Small body (< 1KB on 8082)
+    // NOTE: the 8082 server block has ONLY route `/` (no /uploads), so the
+    // probe must target `/`. A small POST to a directory without upload_dir
+    // correctly returns 403 — the point is it must NOT be 413.
     async a13_small(box) {
       const start = performance.now();
-      const res = await fetch('http://127.0.0.1:8082/uploads/test_small.txt', {
+      const res = await fetch('http://127.0.0.1:8082/', {
         method: 'POST',
         body: 'small payload under 1KB limit'
       });
       const text = await res.text();
-      const ok = res.status === 200 || res.status === 201;
+      const ok = res.status !== 413;
       renderCardResult(box, res.status, res.statusText, res.headers, text, performance.now() - start,
-        '[A-13] Payload within 1KB limit accepted on port 8082.', ok);
+        '[A-13] Payload within 1KB limit accepted on port 8082 (any non-413; dir POST without upload_dir is 403).', ok);
       return ok;
     },
 
@@ -252,7 +258,7 @@
     async a13_large(box) {
       const start = performance.now();
       const oversized = new Uint8Array(2048); // 2KB > 1KB limit
-      const res = await fetch('http://127.0.0.1:8082/uploads/test_big.txt', {
+      const res = await fetch('http://127.0.0.1:8082/', {
         method: 'POST',
         body: oversized
       });
@@ -263,19 +269,23 @@
       return ok;
     },
 
-    // [A-14] Configured Routes Resolution
+    // [A-14] Configured Routes Resolution — all 6 routes from config.yaml.
     async a14(box) {
       const start = performance.now();
-      const [r1, r2, r3, r4] = await Promise.all([
+      const [r1, r2, r3, r4, r5, r6] = await Promise.all([
         fetch('/'),
         fetch('/listing/'),
         fetch('/uploads/'),
-        fetch('/cgi-bin/hello.py')
+        fetch('/readonly/'),
+        fetch('/cgi-bin/hello.py'),
+        fetch('/old-page', { redirect: 'manual' })
       ]);
-      const ok = r1.status === 200 && r2.status === 200 && r3.status === 200 && r4.status === 200;
-      const text = `Routes checked: / (${r1.status}), /listing/ (${r2.status}), /uploads/ (${r3.status}), /cgi-bin/ (${r4.status})`;
+      // /old-page is a 301 (opaqueredirect in browser manual mode).
+      const r6ok = r6.type === 'opaqueredirect' || r6.status === 301;
+      const ok = r1.status === 200 && r2.status === 200 && r3.status === 200 && r4.status === 200 && r5.status === 200 && r6ok;
+      const text = `Routes checked: / (${r1.status}), /listing/ (${r2.status}), /uploads/ (${r3.status}), /readonly/ (${r4.status}), /cgi-bin/ (${r5.status}), /old-page (${r6.type === 'opaqueredirect' ? 'opaqueredirect/301' : r6.status})`;
       renderCardResult(box, 200, 'Routes OK', null, text, performance.now() - start,
-        '[A-14] All configured prefix routes properly resolved to their targets.', ok);
+        '[A-14] All 6 configured prefix routes properly resolved to their targets.', ok);
       return ok;
     },
 
@@ -400,15 +410,23 @@
       return match;
     },
 
-    // [A-22] Sessions & Cookies
+    // [A-22] Sessions & Cookies — two-request counter proof.
+    // Single fetch + contains('session') passes even with cookies broken.
+    // Real proof: counter goes 1 -> 2 across same-origin fetches (cookies
+    // sent automatically) and markup is `Requests on it`, not `Visits:`.
     async a22(box) {
       const start = performance.now();
-      const res = await fetch('/session');
-      const text = await res.text();
-      const ok = res.status === 200 && text.includes('session');
-      renderCardResult(box, res.status, res.statusText, res.headers, text, performance.now() - start,
-        '[A-22] Session accessed; Set-Cookie / session storage confirmed active.', ok);
-      return ok;
+      const res1 = await fetch('/session');
+      const text1 = await res1.text();
+      const m1 = text1.match(/Requests on it<\/th><td>(\d+)<\/td>/);
+      const res2 = await fetch('/session');
+      const text2 = await res2.text();
+      const m2 = text2.match(/Requests on it<\/th><td>(\d+)<\/td>/);
+      const ok = res1.status === 200 && res2.status === 200 && m1 && m2 && (parseInt(m2[1], 10) === parseInt(m1[1], 10) + 1);
+      const summary = `Visit 1: ${m1 ? m1[1] : 'n/a'} -> Visit 2: ${m2 ? m2[1] : 'n/a'}\n${text2.substring(0, 400)}`;
+      renderCardResult(box, res2.status, res2.statusText, res2.headers, summary, performance.now() - start,
+        '[A-22] Session counter incremented 1 -> 2 across cookie round-trip (Set-Cookie issued).', !!ok);
+      return !!ok;
     },
 
     // [A-24] Headers Compliance
@@ -426,14 +444,17 @@
       return ok;
     },
 
-    // [A-25] Wrong URL / Path Traversal
+    // [A-25] Wrong URL / Path Traversal — must use ENCODED traversal.
+    // Raw fetch('/../../etc/passwd') is normalized by the browser to
+    // '/etc/passwd' -> 404 before it ever reaches the server. Encoded
+    // %2e%2e hits the real 403 defence (decode-first, path.rs).
     async a25(box) {
       const start = performance.now();
-      const res = await fetch('/../../etc/passwd');
+      const res = await fetch('/%2e%2e/%2e%2e/etc/passwd');
       const text = await res.text();
-      const ok = res.status === 404 || res.status === 403;
+      const ok = res.status === 403;
       renderCardResult(box, res.status, res.statusText, res.headers, text, performance.now() - start,
-        `[A-25] Path traversal blocked with status ${res.status}.`, ok);
+        `[A-25] Encoded path traversal blocked with status ${res.status} (expected 403).`, ok);
       return ok;
     },
 
@@ -448,12 +469,14 @@
       return ok;
     },
 
-    // [A-27] Redirection
+    // [A-27] Redirection — strict: 301 or opaqueredirect only.
+    // Accepting 200 here is a tautology (broken redirect still PASS).
     async a27(box) {
       const start = performance.now();
       const res = await fetch('/old-page', { redirect: 'manual' });
-      // In browser, manual redirect mode gives opaqueredirect or status 0/301
-      const ok = res.type === 'opaqueredirect' || res.status === 301 || res.status === 200;
+      // In browser, manual redirect mode gives opaqueredirect or status 301.
+      // 200 means NO redirect happened and must FAIL.
+      const ok = res.type === 'opaqueredirect' || res.status === 301;
       renderCardResult(box, 301, 'Moved Permanently', null, 'Location: /index.html\nRedirect followed automatically by browser.', performance.now() - start,
         '[A-27] 301 redirection route configured and functioning.', ok);
       return ok;

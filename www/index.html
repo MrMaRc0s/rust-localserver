@@ -38,6 +38,10 @@
         <span class="telemetry-val" id="tele-fds">7</span>
       </div>
       <div class="telemetry-item">
+        <span class="telemetry-label">Connections</span>
+        <span class="telemetry-val" id="tele-conns">0</span>
+      </div>
+      <div class="telemetry-item">
         <span class="telemetry-label">Active Sessions</span>
         <span class="telemetry-val" id="tele-sessions">0</span>
       </div>
@@ -147,7 +151,7 @@
             <span class="status-badge" style="background:var(--panel);">Host: test.com</span>
           </div>
           <div class="q-title">Virtual Hosts: Alternate Host</div>
-          <div class="q-desc">Request to port 8080 with Host: test.com routes to second server block (root: www/site2).</div>
+          <div class="q-desc">Request to port 8080 with X-Host: test.com (browser-safe alias for Host) routes to second server block (root: www/site2). Real audit: curl --resolve test.com:8080:127.0.0.1 http://test.com:8080/</div>
         </div>
         <div>
           <div class="card-actions">
@@ -795,7 +799,7 @@ async function runSlowCgiDemo() {
   const btn = document.getElementById('btn-slow-cgi');
   const out = document.getElementById('slow-out');
   btn.disabled = true;
-  out.textContent = 'Executing slow.py (sleeping for 15s)... Deadline is 10s.\nDemonstrating that server is responsive during sleep...';
+  out.textContent = 'Executing slow.py (sleeping for 120s)... Server deadline is 10s -> expect 504.\nDemonstrating that server is responsive during sleep...';
 
   // Concurrently fetch root to show server is not blocked
   setTimeout(async () => {
@@ -822,18 +826,20 @@ async function incrementSessionVisits() {
   const res = await fetch('/session');
   const text = await res.text();
 
-  // Extract visit count if present
-  const match = text.match(/Visits:\s*(\d+)/i);
+  // Server markup is `Requests on it</th><td>N</td>` (session_page.rs) —
+  // never `Visits: N`.
+  const match = text.match(/Requests on it<\/th><td>(\d+)<\/td>/);
   const visits = match ? match[1] : 'Unknown';
   display.innerHTML = `<strong>Status:</strong> ${res.status} ${res.statusText}<br><strong>Visit Count:</strong> ${visits}<br><strong>Response Preview:</strong><br>${escapeHtmlInline(text.substring(0, 300))}...`;
 }
 
 async function loginSession() {
   const username = document.getElementById('auth-username').value;
-  const res = await fetch('/session', {
+  // Server only honours POST /session/login with field `name=` (session_page.rs:50).
+  const res = await fetch('/session/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'action=login&username=' + encodeURIComponent(username)
+    body: 'name=' + encodeURIComponent(username)
   });
   document.getElementById('auth-status').textContent = `Signed in as: ${username} (Status ${res.status})`;
   incrementSessionVisits();

@@ -41,14 +41,11 @@ extern "C" fn cleanup_server() {
 }
 
 struct ServerProcess {
-    child: Child,
     child: Option<Child>,
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -70,13 +67,10 @@ fn ensure_server() {
             return Mutex::new(ServerProcess { child: None });
         }
 
-        // If an earlier process just terminated, wait up to 2s for ports to release
-        for &port in &[8080, 8081, 8082] {
         // Wait up to 3s for any lingering socket on these ports to be fully released
         for &port in &ports {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(2) {
             while start.elapsed() < Duration::from_secs(3) {
                 if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
                     break;
@@ -84,8 +78,6 @@ fn ensure_server() {
                 thread::sleep(Duration::from_millis(100));
             }
         }
-
-        let bin = env!("CARGO_BIN_EXE_localserver");
 
         // Spawn server process configured with config.yaml
         let mut cmd = Command::new(bin);
@@ -120,7 +112,6 @@ fn ensure_server() {
             }
         }
 
-        Mutex::new(ServerProcess { child })
         Mutex::new(ServerProcess { child: Some(child) })
     });
 }
@@ -759,5 +750,319 @@ fn test_p_security_hardening() {
     assert!(!body.contains("<script>alert(1)</script>"));
     assert!(body.contains("&lt;script&gt;"));
     assert!(body.contains("&quot;&gt;"));
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for visual-audit dashboard bugs (A-13, A-25, A-27, A-22).
+// Each test codifies the backend truth so a visual card with wrong
+// expectations (false PASS / false FAIL) is caught.
+// ---------------------------------------------------------------------------
+
+/// [A-13] The 8082 server block has ONLY route `/` (config.yaml:133-138).
+/// The visual `a13_small` card POSTs to `http://127.0.0.1:8082/uploads/...`
+/// and expects 200/201 — but the correct backend answer is 403 (no upload
+/// route), not 200. POSTs to `/` are the valid body-limit probe.
+#[test]
+fn test_q_8082_routing_and_body_limit() {
+    ensure_server();
+
+    // 1. Small POST to a non-existent /uploads route on 8082 must be 403,
+    //    proving the visual card targets the wrong URL (false FAIL today).
+    let small = "small payload under 1KB limit";
+    let req_bad_route = format!(
+        "POST /uploads/test_small.txt HTTP/1.1\r\nHost: tiny.local\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+        small.len(),
+        small
+    );
+    let resp = request(8082, &req_bad_route);
+    assert_eq!(
+        resp.status, 403,
+        "8082 has no /uploads route: small POST must be 403, not 200/201"
+    );
+
+    // 2. Small POST to `/` on 8082 must NOT be 413 (limit is 1K).
+    let req_small = format!(
+        "POST / HTTP/1.1\r\nHost: tiny.local\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+        small.len(),
+        small
+    );
+    let resp_small = request(8082, &req_small);
+    assert_ne!(resp_small.status, 413, "256B-scale body on 8082 must not be 413");
+
+    // 3. 2KB POST to `/` on 8082 must be exactly 413.
+    let big = vec![b'X'; 2048];
+    let req_big = format!(
+        "POST / HTTP/1.1\r\nHost: tiny.local\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+        big.len(),
+        String::from_utf8_lossy(&big)
+    );
+    let resp_big = request(8082, &req_big);
+    assert_eq!(resp_big.status, 413, "2KB body on 1K-limited 8082 must be 413");
+}
+
+/// [A-27] `/old-page` must be exactly 301 + `Location: /index.html`.
+/// The visual `a27` card accepts `opaqueredirect || 301 || 200`, so a
+/// broken redirect returning 200 still shows PASS (tautology).
+#[test]
+fn test_r_redirect_strict_301() {
+    ensure_server();
+    let resp = request(8080, "GET /old-page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(resp.status, 301, "visual a27 must not accept 200 as success");
+    assert_eq!(resp.header("location"), Some("/index.html"));
+    // And the target itself must be servable.
+    let target = request(8080, "GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(target.status, 200);
+}
+
+/// [A-25] Browser `fetch('/../../etc/passwd')` normalizes `..` client-side,
+/// so the server sees `/etc/passwd` → 404. The real 403 traversal defence
+/// is only hit with a raw socket or percent-encoded `%2e%2e`.
+#[test]
+fn test_s_traversal_encoding_distinction() {
+    ensure_server();
+
+    // Raw `..` above root → 403 (lexical normalisation, path.rs:81-101).
+    let raw = request(8080, "GET /../../etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(raw.status, 403, "raw /../../etc/passwd must be 403");
+
+    // Encoded `..` → also 403 (decode-first ordering, path.rs:209-219).
+    let enc = request(8080, "GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(enc.status, 403, "encoded traversal must be 403");
+
+    // NUL → 400.
+    let nul = request(8080, "GET /%00invalid-nul HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(nul.status, 400);
+
+    // What the browser actually sends after normalisation → 404, NOT 403.
+    // A visual test asserting `404 || 403` on this URL proves nothing.
+    let normalized = request(8080, "GET /etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(normalized.status, 404);
+}
+
+/// [A-22] Session contract the visual `a22` card does not check:
+/// single `GET /session` + `contains('session')` passes even with cookies
+/// broken. Real proof needs Set-Cookie round-trip + counter 1→2, and the
+/// page markup is `Requests on it`, not `Visits:` (visual regex bug).
+/// The visual `loginSession()` POSTs `action=login&username=` to `/session`,
+/// but the server only honours `POST /session/login` + `name=` (session_page.rs:50).
+#[test]
+fn test_t_session_login_contract() {
+    ensure_server();
+
+    // 1. Markup uses "Requests on it", never "Visits:".
+    let r1 = request(8080, "GET /session HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(r1.status, 200);
+    let body1 = r1.text();
+    assert!(body1.contains("Requests on it</th><td>1</td>"), "counter starts at 1");
+    assert!(!body1.contains("Visits:"), "page never contains 'Visits:' — visual regex is wrong");
+    let set_cookie = r1.header("set-cookie").expect("Set-Cookie on new session").to_string();
+    assert!(set_cookie.contains("localserver_session="));
+    let cookie = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // 2. Wrong login shape (what the visual sends) must NOT sign in.
+    let wrong_body = "action=login&username=auditor";
+    let req_wrong = format!(
+        "POST /session HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        wrong_body.len(),
+        wrong_body
+    );
+    let r_wrong = request(8080, &req_wrong);
+    // Treated as Show, not Login: no 303, no greeting.
+    assert_ne!(r_wrong.status, 303, "POST /session with action=login must not log in");
+    assert!(!r_wrong.text().contains("Hello, <strong>auditor</strong>"));
+
+    // 3. Correct login shape must 303 + persist name.
+    let good_body = "name=auditor";
+    let req_good = format!(
+        "POST /session/login HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        good_body.len(),
+        good_body
+    );
+    let r_good = request(8080, &req_good);
+    assert_eq!(r_good.status, 303, "POST /session/login with name= must 303");
+    assert_eq!(r_good.header("location"), Some("/session"));
+
+    let req_after = format!("GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n");
+    let r_after = request(8080, &req_after);
+    assert_eq!(r_after.status, 200);
+    assert!(r_after.text().contains("Hello, <strong>auditor</strong>"), "name must persist after correct login");
+}
+
+/// [A-11] The visual `a11_vhost` card sends `X-Host: test.com` because
+/// browsers forbid setting `Host`. The server honours it (request.rs), but
+/// the real audit uses `Host:`. Both must route to site2.
+#[test]
+fn test_u_vhost_host_and_xhost_parity() {
+    ensure_server();
+    let via_host = request(8080, "GET / HTTP/1.1\r\nHost: test.com\r\nConnection: close\r\n\r\n");
+    assert_eq!(via_host.status, 200);
+    assert!(via_host.text().contains("test.com"), "Host: test.com must serve site2");
+
+    let via_xhost = request(8080, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Host: test.com\r\nConnection: close\r\n\r\n");
+    assert_eq!(via_xhost.status, 200);
+    assert!(via_xhost.text().contains("test.com"), "X-Host: test.com must also serve site2 (visual workaround)");
+}
+
+/// Dashboard coherence (no server needed): every `getElementById` / `res-*`
+/// referenced by `audit-console.js` must exist in `index.html`, and every
+/// `auditRunner.*` referenced in HTML must be defined in JS. Catches
+/// `tele-conns` / `admin-live-json` dead hooks and similar drift.
+#[test]
+fn test_v_dashboard_asset_coherence() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let html = std::fs::read_to_string(root.join("www/index.html")).expect("read index.html");
+    let js = std::fs::read_to_string(root.join("www/static/audit-console.js")).expect("read audit-console.js");
+    let css = std::fs::read_to_string(root.join("www/static/style.css")).expect("read style.css");
+
+    // 1. All res-* boxes referenced by runAllAuditTests keys exist in HTML.
+    for key in ["a9","a10","a11_default","a11_vhost","a12_404","a12_405","a13_small","a13_large","a14","a15","a16_allowed","a16_forbidden","a17","a18","a19","a20","a21","a22","a24","a25","a26","a27","a28_python","a28_perl","a40"] {
+        assert!(html.contains(&format!("id=\"res-{key}\"")), "missing <div id=\"res-{key}\"> in index.html");
+        assert!(js.contains(&format!("async {key}(")) || js.contains(&format!("{key}(")), "missing auditRunner.{key} in audit-console.js");
+    }
+
+    // 2. Telemetry IDs polled by JS must exist in HTML.
+    //    Currently `tele-conns` is polled but has no element (visual bug).
+    for id in ["tele-uptime", "tele-reqs", "tele-fds", "tele-sessions"] {
+        assert!(html.contains(&format!("id=\"{id}\"")), "missing telemetry #{id}");
+        assert!(js.contains(id), "JS should poll #{id}");
+    }
+
+    // 3. Core dashboard classes used in HTML must be defined in CSS.
+    for class in ["telemetry-bar", "tab-nav", "tab-panel", "audit-grid", "audit-card", "status-badge"] {
+        assert!(css.contains(class), "missing .{class} in style.css");
+    }
+
+    // 4. Static assets referenced by the dashboard must exist on disk.
+    assert!(root.join("www/static/style.css").is_file());
+    assert!(root.join("www/static/audit-console.js").is_file());
+    assert!(root.join("www/static/logo.png").is_file());
+}
+
+/// Visual-dashboard correctness (no server needed): asserts the FIXED
+/// dashboard logic. Each assertion corresponds to a false PASS / false FAIL
+/// found by the audit agents. This test FAILS on the pre-fix dashboard and
+/// PASSES once the visuals are corrected.
+#[test]
+fn test_w_visual_dashboard_correctness() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let html = std::fs::read_to_string(root.join("www/index.html")).expect("read index.html");
+    let js = std::fs::read_to_string(root.join("www/static/audit-console.js")).expect("read audit-console.js");
+
+    // Helper: extract one audit function body from JS by name.
+    fn fn_body<'a>(js: &'a str, name: &str) -> &'a str {
+        let marker = format!("async {name}(");
+        let start = js.find(&marker).unwrap_or_else(|| panic!("auditRunner.{name} not found"));
+        let rest = &js[start..];
+        // Take until the next `async <word>(` at same indent or end.
+        let mut end = rest.len();
+        for (i, _) in rest.match_indices("\n    async ") {
+            if i > 10 {
+                end = i;
+                break;
+            }
+        }
+        &rest[..end]
+    }
+
+    // [A-13] a13_small AND a13_large must probe 8082 `/` (the only route on
+    // that server), never 8082 `/uploads/*` (which is correctly 403).
+    for name in ["a13_small", "a13_large"] {
+        let body = fn_body(&js, name);
+        assert!(
+            !body.contains("8082/uploads"),
+            "{name} must not target 8082/uploads (that route does not exist on 8082)"
+        );
+        assert!(
+            body.contains("127.0.0.1:8082/") || body.contains("127.0.0.1:8082\"") || body.contains("8082/\"") || body.contains("8082/')") || body.contains(":8082/"),
+            "{name} must target port 8082 root path"
+        );
+    }
+    // a13_small must accept any non-413 (backend returns 403 for POST / dir
+    // without upload_dir), or explicitly handle 403 — not demand 200/201.
+    let small_body = fn_body(&js, "a13_small");
+    assert!(
+        !small_body.contains("res.status === 200 || res.status === 201"),
+        "a13_small must not demand 200/201 on 8082 (backend correctly returns 403 for dir POST)"
+    );
+
+    // [A-27] a27 must require 301/opaqueredirect and must NOT accept 200.
+    let a27 = fn_body(&js, "a27");
+    assert!(a27.contains("301"), "a27 must check for 301");
+    assert!(
+        !a27.contains("|| res.status === 200") && !a27.contains("|| 200") && !a27.contains("=== 200"),
+        "a27 must not accept 200 as redirect success (tautology)"
+    );
+
+    // [A-25] a25 must use percent-encoded traversal so the 403 path is hit.
+    // Raw `/../../` is normalized by the browser to `/etc/passwd` → 404.
+    let a25 = fn_body(&js, "a25");
+    assert!(
+        a25.contains("%2e%2e") || a25.contains("%2E%2E") || a25.contains("%2f") || a25.contains("%2F"),
+        "a25 must use encoded traversal (raw /../../ never reaches the server)"
+    );
+
+    // [A-22] a22 must verify the session counter across two requests with
+    // the real markup `Requests on it`, not a single contains('session').
+    let a22 = fn_body(&js, "a22");
+    assert!(
+        a22.contains("Requests on it"),
+        "a22 must assert the real 'Requests on it' markup (page never contains 'Visits:')"
+    );
+
+    // Session tab inline helpers in index.html:
+    // - login must POST to /session/login with field name=
+    assert!(html.contains("/session/login"), "login helper must POST to /session/login");
+    assert!(
+        !html.contains("action=login&username="),
+        "login helper must not use action=login&username= (server ignores it)"
+    );
+    // - visit counter regex must match real markup
+    assert!(
+        html.contains("Requests on it"),
+        "session display helper must parse 'Requests on it', not 'Visits:'"
+    );
+
+    // Telemetry: if JS polls tele-conns, the element must exist.
+    if js.contains("tele-conns") {
+        assert!(html.contains("id=\"tele-conns\""), "JS polls #tele-conns but index.html has no such element");
+    }
+
+    // CGI lab label: slow.py sleeps 120s with a 10s server deadline.
+    // The dashboard must not claim "sleeping for 15s".
+    assert!(
+        !html.contains("sleeping for 15s") && !html.contains("sleeping for 15 s"),
+        "slow.py sleeps 120s — label claiming 15s is wrong"
+    );
+
+    // Virtual-host static isolation: test.com root is www/site2, so
+    // /static/* on that vhost needs www/site2/static/* to exist.
+    assert!(
+        root.join("www/site2/static/style.css").is_file() || root.join("www/site2/static").is_symlink(),
+        "www/site2/static/style.css missing — test.com page renders unstyled"
+    );
+
+    // [A-14] a14 must cover all 6 routes, including /readonly and /old-page.
+    let a14 = fn_body(&js, "a14");
+    for route in ["/readonly", "/old-page", "/listing", "/uploads", "/cgi-bin"] {
+        assert!(a14.contains(route), "a14 must probe route {route} (all 6 routes required)");
+    }
+}
+
+/// CORS preflight: browsers send OPTIONS before non-simple cross-origin
+/// fetches (X-Host header, octet-stream bodies). Must be 204, not 501/405,
+/// or the visual a9/a10/a11/a13 cards are blocked when the dashboard on
+/// :8080 probes :8081/:8082.
+#[test]
+fn test_x_cors_preflight_options() {
+    ensure_server();
+    for path in ["/", "/uploads/", "/cgi-bin/hello.py", "/session", "/admin/metrics.json"] {
+        let raw = format!("OPTIONS {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:8080\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n");
+        let resp = request(8080, &raw);
+        assert_eq!(resp.status, 204, "OPTIONS {path} must be 204 preflight OK");
+        assert_eq!(resp.header("access-control-allow-origin"), Some("*"));
+    }
+    // Preflight on another port too.
+    let resp = request(8081, "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:8080\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n");
+    assert_eq!(resp.status, 204);
 }
 
