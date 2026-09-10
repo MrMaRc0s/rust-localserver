@@ -54,6 +54,7 @@ use crate::cgi::{CgiProcess, CgiStep};
 use crate::connection::{Action, Connection, Timeout};
 use crate::error;
 use crate::handlers::Reply;
+use crate::metrics::Metrics;
 use crate::utils::session::{SessionStore, DEFAULT_TTL};
 
 /// Listener tokens occupy `[0, CONNECTION_TOKEN_BASE)`, connection tokens start
@@ -140,6 +141,7 @@ pub struct Server {
     /// enough; see [`crate::utils::session`].
     sessions: Rc<RefCell<SessionStore>>,
     last_session_sweep: Instant,
+    metrics: Rc<RefCell<Metrics>>,
     /// Running scripts, keyed by the connection waiting for each.
     cgi: HashMap<Token, CgiProcess>,
     /// Pipe token to the connection that owns it, so a pipe event can be routed
@@ -241,6 +243,7 @@ impl Server {
             accepted: 0,
             sessions: Rc::new(RefCell::new(SessionStore::new(DEFAULT_TTL))),
             last_session_sweep: Instant::now(),
+            metrics: Rc::new(RefCell::new(Metrics::new())),
             cgi: HashMap::new(),
             cgi_pipes: HashMap::new(),
             next_cgi_token: CGI_TOKEN_BASE,
@@ -262,6 +265,7 @@ impl Server {
 
             for event in events.iter() {
                 let token = event.token();
+                eprintln!("DEBUG EVENT: token={:?} readable={} writable={}", token, event.is_readable(), event.is_writable());
                 if token.0 < CONNECTION_TOKEN_BASE {
                     self.accept_from(token);
                 } else if token.0 < CGI_TOKEN_BASE {
@@ -317,7 +321,16 @@ impl Server {
                 }
             };
 
-            self.register_connection(socket, peer, max_body, port, servers, sessions);
+            self.metrics.borrow_mut().record_connection_open();
+            self.register_connection(
+                socket,
+                peer,
+                max_body,
+                port,
+                servers,
+                sessions,
+                Rc::clone(&self.metrics),
+            );
         }
     }
 
@@ -329,6 +342,7 @@ impl Server {
         port: u16,
         servers: Rc<Vec<ServerConfig>>,
         sessions: Rc<RefCell<SessionStore>>,
+        metrics: Rc<RefCell<Metrics>>,
     ) {
         // Small responses should leave immediately rather than waiting for
         // Nagle to coalesce them with data that will never come.
@@ -346,13 +360,14 @@ impl Server {
             // than leak the descriptor.
             eprintln!("localserver: register {peer} failed: {e}");
             self.free_tokens.push(token.0);
+            self.metrics.borrow_mut().record_connection_close();
             return;
         }
 
         self.connections
             .insert(
                 token,
-                Connection::new(socket, peer, token, max_body, port, servers, sessions),
+                Connection::new(socket, peer, token, max_body, port, servers, sessions, metrics),
             );
         self.accepted += 1;
     }
@@ -374,8 +389,7 @@ impl Server {
             let mut action = Action::Keep;
             if event.is_readable() {
                 action = connection.on_readable();
-            }
-            if action == Action::Keep && event.is_writable() {
+            } else if event.is_writable() {
                 action = connection.on_writable();
             }
             Some((action, connection.desired_interest(), connection.take_rearm()))
@@ -448,6 +462,7 @@ impl Server {
             // worth reporting.
             let _ = connection.socket.shutdown(std::net::Shutdown::Both);
             self.free_tokens.push(token.0);
+            self.metrics.borrow_mut().record_connection_close();
         }
         self.unthrottle();
     }
@@ -522,7 +537,10 @@ impl Server {
         let stderr_token = Token(self.alloc_cgi_token());
 
         let mut process = match CgiProcess::spawn(&spec, stdin_token, stdout_token, stderr_token) {
-            Ok(process) => process,
+            Ok(process) => {
+                self.metrics.borrow_mut().record_cgi_spawn();
+                process
+            }
             Err(e) => {
                 eprintln!(
                     "localserver: could not start {}: {e}",
@@ -704,6 +722,7 @@ impl Server {
 
     /// Answer the waiting client with an error instead of script output.
     fn finish_cgi_with_status(&mut self, connection: Token, status: u16) {
+        self.metrics.borrow_mut().record_cgi_failure();
         if let Some(mut process) = self.cgi.remove(&connection) {
             self.release_cgi_pipes(&mut process);
         }
@@ -731,6 +750,7 @@ impl Server {
     }
 
     fn kill_cgi(&mut self, connection: Token) {
+        self.metrics.borrow_mut().record_cgi_timeout();
         if let Some(process) = self.cgi.get_mut(&connection) {
             process.kill();
         }

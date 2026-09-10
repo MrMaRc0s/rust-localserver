@@ -26,6 +26,7 @@
 // rather than merely discouraged (TASKS.md 2.7, the "never crash" rule).
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod admin_page;
 pub mod session_page;
 
 use std::fs::{self, File};
@@ -359,7 +360,7 @@ fn encode_segment(input: &str) -> String {
 }
 
 /// Human-readable size, so a listing is readable at a glance.
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes} B");

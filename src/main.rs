@@ -16,6 +16,7 @@ mod http;
 mod router;
 mod server;
 mod utils;
+mod metrics;
 
 use std::path::Path;
 use std::process::ExitCode;

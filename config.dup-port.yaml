@@ -1,0 +1,30 @@
+# Deliberate misconfiguration: duplicate port + server_name conflict (Audit A-30).
+# Two server blocks claim the same server_name on the same host:port.
+# localserver must reject this at startup with exit code 2 and a fatal error message.
+
+servers:
+  - host: 127.0.0.1
+    ports:
+      - 8080
+    server_names:
+      - localhost
+    is_default: true
+    client_max_body_size: 1M
+    routes:
+      - path: /
+        methods:
+          - GET
+        root: www
+
+  - host: 127.0.0.1
+    ports:
+      - 8080
+    server_names:
+      - localhost
+    is_default: false
+    client_max_body_size: 1M
+    routes:
+      - path: /
+        methods:
+          - GET
+        root: www

@@ -75,10 +75,12 @@ use std::rc::Rc;
 use crate::cgi::CgiSpec;
 use crate::config::{Method, ServerConfig};
 use crate::error;
+use crate::handlers::admin_page;
 use crate::handlers::session_page::{self, Command};
 use crate::handlers::{self, FileBody, Reply, STREAM_CHUNK};
 use crate::http::request::{Progress, Request, RequestParser};
 use crate::http::response::Response;
+use crate::metrics::Metrics;
 use crate::router::{self, Resolution};
 use crate::utils::cookie::{self, SetCookie};
 use crate::utils::session::{self, SessionStore};
@@ -231,6 +233,7 @@ pub struct Connection {
     /// nothing. `RefCell` still enforces the borrow rules at runtime, so an
     /// accidental nested borrow is caught rather than corrupting the map.
     sessions: Rc<RefCell<SessionStore>>,
+    metrics: Rc<RefCell<Metrics>>,
     /// The virtual host's body limit has been applied to the parser.
     limit_narrowed: bool,
     /// The last read filled the buffer, so the socket may hold more. Because
@@ -255,6 +258,7 @@ impl Connection {
         local_port: u16,
         servers: Rc<Vec<ServerConfig>>,
         sessions: Rc<RefCell<SessionStore>>,
+        metrics: Rc<RefCell<Metrics>>,
     ) -> Connection {
         let now = Instant::now();
         Connection {
@@ -274,6 +278,7 @@ impl Connection {
             local_port,
             servers,
             sessions,
+            metrics,
             limit_narrowed: false,
             rearm: false,
             created_at: now,
@@ -308,6 +313,9 @@ impl Connection {
         let outcome = classify_read(self.socket.read(chunk));
         if let IoOutcome::Progress(n) = outcome {
             self.last_activity = Instant::now();
+            if let Ok(mut m) = self.metrics.try_borrow_mut() {
+                m.record_bytes_in(n);
+            }
             // A short read means the socket buffer is empty and a fresh edge
             // will arrive with the next data. A full one means there may be
             // more waiting, which an edge-triggered registration will not
@@ -334,6 +342,9 @@ impl Connection {
         if let IoOutcome::Progress(n) = outcome {
             self.write_pos += n;
             self.last_activity = Instant::now();
+            if let Ok(mut m) = self.metrics.try_borrow_mut() {
+                m.record_bytes_out(n);
+            }
             // A *partial* write means the socket buffer filled up, so a real
             // writable edge will arrive when the peer drains it. A *complete*
             // write leaves the socket writable with no transition at all, and
@@ -461,6 +472,9 @@ impl Connection {
                         && self.parser.head().map(|h| h.expects_continue()).unwrap_or(false)
                     {
                         self.sent_continue = true;
+                        if let Ok(mut m) = self.metrics.try_borrow_mut() {
+                            m.record_response(100);
+                        }
                         self.queue(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec(), AfterWrite::ResumeBody);
                     }
                 }
@@ -474,6 +488,9 @@ impl Connection {
                     // is the safe response to an impossible state.
                     None => return Action::Close,
                 };
+                if let Ok(mut m) = self.metrics.try_borrow_mut() {
+                    m.record_request(&request.method);
+                }
                 self.sent_continue = false;
                 self.limit_narrowed = false;
                 self.keep_alive = request.wants_keep_alive();
@@ -482,6 +499,7 @@ impl Connection {
                 let reply = build_reply(
                     &self.servers,
                     &self.sessions,
+                    &self.metrics,
                     &request,
                     self.peer,
                     self.local_port,
@@ -521,6 +539,9 @@ impl Connection {
     /// Queue a reply whose body may still be on disk.
     fn queue_reply(&mut self, reply: Reply, after: AfterWrite) {
         let Reply { response, body } = reply;
+        if let Ok(mut m) = self.metrics.try_borrow_mut() {
+            m.record_response(response.status);
+        }
         self.write_buf = response.to_bytes(self.keep_alive);
         self.write_pos = 0;
         self.body_source = body;
@@ -553,6 +574,9 @@ impl Connection {
     /// means a custom 400 page works even for a request too broken to name a
     /// host.
     fn error_bytes(&self, status: u16) -> Vec<u8> {
+        if let Ok(mut m) = self.metrics.try_borrow_mut() {
+            m.record_response(status);
+        }
         let response = match router::select_server(&self.servers, None) {
             Some(server) => error::page(server, status),
             None => error::builtin(status),
@@ -664,6 +688,7 @@ impl Connection {
 fn build_reply(
     servers: &[ServerConfig],
     sessions: &Rc<RefCell<SessionStore>>,
+    metrics: &Rc<RefCell<Metrics>>,
     request: &Request,
     remote: SocketAddr,
     port: u16,
@@ -671,7 +696,9 @@ fn build_reply(
 ) -> Reply {
     let session = resolve_session(sessions, request);
 
-    let mut reply = if session_page::owns(&request.path) {
+    let mut reply = if admin_page::owns(&request.path) {
+        admin_endpoint(metrics, sessions, request)
+    } else if session_page::owns(&request.path) {
         session_demo(sessions, request, &session)
     } else {
         match route_request(servers, request, remote, port) {
@@ -695,6 +722,35 @@ fn build_reply(
                 reply.response = reply.response.header("Set-Cookie", cookie.to_string());
             }
         }
+    }
+    reply
+}
+
+/// Serve the `/admin` dashboard and metrics endpoints.
+fn admin_endpoint(
+    metrics: &Rc<RefCell<Metrics>>,
+    sessions: &Rc<RefCell<SessionStore>>,
+    request: &Request,
+) -> Reply {
+    if request.method != "GET" && request.method != "HEAD" {
+        return Reply::immediate(
+            Response::new(405)
+                .header("Allow", "GET, HEAD")
+                .header("Content-Length", "0"),
+        );
+    }
+    let active_sessions = sessions.try_borrow().map(|s| s.len()).unwrap_or(0);
+    let metrics_guard = match metrics.try_borrow() {
+        Ok(g) => g,
+        Err(_) => return Reply::immediate(error::builtin(500)),
+    };
+    let mut reply = if request.path == "/admin/metrics.json" {
+        admin_page::metrics_json(&metrics_guard, active_sessions)
+    } else {
+        admin_page::page(&metrics_guard, active_sessions)
+    };
+    if request.method_enum() == Some(Method::Head) {
+        reply.response = reply.response.head_only(true);
     }
     reply
 }

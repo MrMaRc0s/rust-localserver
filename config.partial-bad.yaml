@@ -1,0 +1,47 @@
+# Deliberate misconfiguration: common ports, one bad config (Audit A-31).
+# 3 server blocks share port 8080.
+# Server 2 has a nonexistent root path (/nonexistent_path_xyz).
+# localserver must log a warning, skip Server 2, and successfully bind and serve
+# the remaining two servers (site1.local and site3.local).
+
+servers:
+  - host: 127.0.0.1
+    ports:
+      - 8080
+    server_names:
+      - site1.local
+      - localhost
+    is_default: true
+    client_max_body_size: 1M
+    routes:
+      - path: /
+        methods:
+          - GET
+        root: www
+
+  - host: 127.0.0.1
+    ports:
+      - 8080
+    server_names:
+      - site2-bad.local
+    is_default: false
+    client_max_body_size: 1M
+    routes:
+      - path: /
+        methods:
+          - GET
+        root: /nonexistent_path_xyz
+
+  - host: 127.0.0.1
+    ports:
+      - 8080
+    server_names:
+      - site3.local
+      - test.com
+    is_default: false
+    client_max_body_size: 1M
+    routes:
+      - path: /
+        methods:
+          - GET
+        root: www/site2
