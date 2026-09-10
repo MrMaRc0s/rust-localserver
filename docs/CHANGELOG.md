@@ -21,6 +21,55 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 8.1 / [A-40] Bonus — Admin Dashboard & Metrics Endpoint** (`src/metrics.rs`, `src/handlers/admin_page.rs`, `src/server.rs`, `src/connection.rs`):
+  - In-memory lock-free telemetry tracking uptime, active/total connections, requests by HTTP method, responses by status code class (1xx..5xx), bytes received and sent, CGI child process metrics (spawned, failed, timed-out), active sessions, and live open file descriptor count parsed from `/proc/self/fd`.
+  - Served at `GET /admin` with a self-refreshing HTML dashboard (3s meta refresh, dark theme matching `/session`, statistics cards and method/status breakdown tables) and at `GET /admin/metrics.json` returning clean machine-readable JSON.
+  - _Why:_ `[A-40]` bonus requirement. Doubles as live debugging and verification proof during stress tests and audits to demonstrate 0 socket and file descriptor leaks in real time.
+
+- **Phase 9.1 / [A-35] — Automated Live Integration Test Suite** (`tests/integration.rs`):
+  - 16 end-to-end integration tests driving a live background `localserver` instance using raw `std::net::TcpStream`.
+  - Comprehensive coverage: static file serving & MIME validation, custom 404 pages, accepted HTTP methods (`DELETE` 204 vs 405 `Allow`), `client_max_body_size` 413 rejection on 1K limit port 8082, virtual host discrimination on port 8080 (`Host: localhost` vs `test.com`), binary multipart upload and roundtrip SHA256 integrity check, 301 Moved Permanently redirects, directory autoindex HTML generation, HTTP pipelined requests in a single TCP write, incremental one-byte-at-a-time trickle parsing, cookie and session visit counter increment, CGI execution for Python and Perl, CGI 504 gateway timeout, malformed garbage request survival (400 Bad Request), admin metrics endpoint validation, and security hardening edge cases (percent-encoded route matching and redirect HTML escaping).
+  - _Why:_ `[A-35]` requires automated test suite proving all protocol, routing, and concurrency guarantees live over real TCP sockets.
+
+- **Phase 9.2 / [A-9..28] — Automated Audit Walkthrough Script** (`tests/audit.sh`):
+  - Self-contained executable bash script exercising all functional audit questions `[A-9]` through `[A-28]` against a live server.
+  - 20 automated checks testing port binding, virtual hosting, custom error pages, body limits, route routing, default index, method permissions, GET/POST/DELETE, garbage request tolerance, binary upload/download integrity, session cookies, browser compatibility headers, autoindex, 301 redirects, and CGI streaming.
+  - _Why:_ Provides a deterministic, single-command validation harness that outputs colorized `[PASS]` lines with exact audit question references.
+
+- **Phase 9.3 & 9.4 / [A-32..34] — Async Stress & Leak Verification Suite** (`tests/stress.py`):
+  - High-performance Python 3 `asyncio` stress harness simulating `siege -b -c 25 -t 10s`.
+  - Concurrently sends thousands of requests across static endpoints, sessions, and CGI.
+  - Automatically measures availability (>= 99.5% target), monitors `/proc/$PID/fd` before and after execution to assert 0 FD leak, checks `ss -tan` to assert 0 lingering `CLOSE_WAIT` connections, and checks `ps --ppid $PID` to assert 0 zombie processes.
+  - _Why:_ Proves stability under heavy concurrency without external dependencies or root permissions.
+
+- **Phase 10.1 / [A-1..40] — Comprehensive Audit Guide & Cheat Sheet** (`docs/AUDIT_GUIDE.md`, `docs/AUDIT_NOTES.md`):
+  - In-depth preparation guide answering all 40 questions from `docs/audit.md`, including architectural explanations, step-by-step code paths, RFC citations, curl verification commands, and defensive audit strategies.
+  - Compact quick-reference table in `docs/AUDIT_NOTES.md` mapping each question `A-1..40` directly to exact source file and line numbers.
+  - _Why:_ Fully prepares the student to defend the architecture, walk through the codebase, and answer any theoretical or practical question posed by the auditor.
+
+- **Phase 10.2 / [A-30, A-31] — Deliberate Misconfiguration Testbeds** (`config.dup-port.yaml`, `config.partial-bad.yaml`):
+  - `config.dup-port.yaml`: Verifies fatal startup abort (exit code 2) when duplicate ports share server names or default status.
+  - `config.partial-bad.yaml`: Verifies two-severity resilience where a server with an invalid root is dropped with a warning, while two valid server blocks on the shared listener continue binding and serving cleanly.
+  - _Why:_ Specifically required by audit questions `[A-30]` and `[A-31]`.
+
+### Fixed & Security
+
+- **[A-5] Strict One-Operation-Per-Poll Invariant** (`src/server.rs`):
+  - Updated event dispatch from sequential `if is_readable() ... if is_writable()` to `if is_readable() ... else if is_writable()`.
+  - _Why:_ Guarantees that even if `mio` returns both readable and writable readiness bits for a socket in a single `epoll_wait` event, the server executes at most one socket syscall per client per event loop tick. Remaining readiness is serviced in the next iteration via edge-triggered re-arming.
+
+- **Reflected HTML Injection in 301 Directory Redirects** (`src/connection.rs`):
+  - Escaped the `Location` URI in the 301 Moved Permanently HTML response body using `crate::handlers::escape_html`.
+  - _Why:_ Prevented potential HTML injection via crafted unescaped request paths when auto-redirecting missing trailing slashes.
+
+- **Percent-Encoded Route Prefix Matching Bypass** (`src/router.rs`, `src/utils/path.rs`):
+  - Added percent-decoding to request paths prior to route prefix matching and introduced `resolve_segments_under` to prevent double percent-decoding during file segment resolution.
+  - _Why:_ Neutralized a route match bypass where requests like `/%75ploads/file.txt` evaded route configurations while accessing the underlying directory.
+
+- **Raw Upload Timestamp Collision Hardening** (`src/handlers/mod.rs`):
+  - Upgraded raw stream upload auto-naming from seconds to nanosecond precision (`as_nanos()`).
+  - _Why:_ Prevents filename overwrites when multiple clients upload raw stream payloads within the same one-second epoch window.
+
 - **Phase 7.1 — non-blocking CGI** (`src/cgi.rs`, `src/server.rs`): scripts run
   as child processes whose stdin, stdout and stderr are set `O_NONBLOCK`,
   wrapped in `mio::unix::SourceFd` and registered in the **same `Poll`** as

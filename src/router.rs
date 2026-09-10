@@ -91,10 +91,11 @@ pub fn select_server<'a>(
 /// A prefix only matches at a segment boundary: `/upload` must not capture
 /// `/uploads`, which is why this is not a plain `starts_with`.
 pub fn match_route<'a>(server: &'a ServerConfig, path: &str) -> Option<&'a RouteConfig> {
+    let decoded = pathutil::percent_decode(path).unwrap_or_else(|_| path.to_string());
     server
         .routes
         .iter()
-        .filter(|route| prefix_matches(&route.path, path))
+        .filter(|route| prefix_matches(&route.path, &decoded))
         .max_by_key(|route| route.path.trim_end_matches('/').len())
 }
 
@@ -152,7 +153,11 @@ fn split_cgi_target(route: &RouteConfig, segments: &[String]) -> Option<(usize, 
 
 /// Resolve a request against the server that will answer it.
 pub fn resolve(server: &ServerConfig, request: &Request) -> Resolution {
-    let route = match match_route(server, &request.path) {
+    let decoded_path = match pathutil::percent_decode(&request.path) {
+        Ok(decoded) => decoded,
+        Err(status) => return Resolution::Error(status),
+    };
+    let route = match match_route(server, &decoded_path) {
         Some(route) => route,
         // No route claims this prefix at all.
         None => return Resolution::Error(404),
@@ -177,12 +182,8 @@ pub fn resolve(server: &ServerConfig, request: &Request) -> Resolution {
     }
 
     // 3. Sanitise before resolving anything on disk.
-    let remainder = remainder_of(&route.path, &request.path);
-    let decoded = match pathutil::percent_decode(&remainder) {
-        Ok(decoded) => decoded,
-        Err(status) => return Resolution::Error(status),
-    };
-    let segments = match pathutil::normalize_segments(&decoded) {
+    let remainder = remainder_of(&route.path, &decoded_path);
+    let segments = match pathutil::normalize_segments(&remainder) {
         Ok(segments) => segments,
         Err(status) => return Resolution::Error(status),
     };
@@ -209,7 +210,7 @@ pub fn resolve(server: &ServerConfig, request: &Request) -> Resolution {
         return Resolution::Cgi { interpreter, script, path_info };
     }
 
-    let target = match pathutil::resolve_under(&route.root, &remainder) {
+    let target = match pathutil::resolve_segments_under(&route.root, &segments) {
         Ok(target) => target,
         Err(status) => return Resolution::Error(status),
     };

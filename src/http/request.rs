@@ -890,4 +890,41 @@ mod tests {
         assert_eq!(progress, Progress::Complete);
         assert_eq!(request.unwrap().path, "/");
     }
+
+    /// Real browsers send many headers curl does not (Accept-Encoding, Sec-Fetch-*,
+    /// conditional requests). The parser must ignore unknown headers and not
+    /// mistake them for errors — this is what [A-23] and the browser pass exercise.
+    #[test]
+    fn browser_headers_do_not_break_parsing() {
+        let wire = b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nAccept: text/html,application/xhtml+xml\r\nAccept-Encoding: gzip, deflate, br\r\nAccept-Language: en-US,en;q=0.9\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: none\r\nCache-Control: max-age=0\r\nConnection: keep-alive\r\n\r\n";
+        let (progress, request) = parse_all(wire, 1024);
+        assert_eq!(progress, Progress::Complete);
+        let req = request.unwrap();
+        assert_eq!(req.path, "/index.html");
+        assert_eq!(req.headers.get("accept-encoding"), Some("gzip, deflate, br"));
+        assert_eq!(req.headers.get("sec-fetch-mode"), Some("navigate"));
+        assert!(req.wants_keep_alive());
+    }
+
+    /// A chunked request that will be forwarded to CGI must be de-chunked first
+    /// ([A-28]). This test proves the parser re-assembles the body before it
+    /// ever reaches the CGI stdin pump.
+    #[test]
+    fn chunked_body_for_cgi_is_decoded_before_handling() {
+        let wire = b"POST /cgi-bin/hello.py HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let (progress, request) = parse_all(wire, 1024);
+        assert_eq!(progress, Progress::Complete);
+        let req = request.unwrap();
+        assert_eq!(req.body, b"hello world");
+        assert_eq!(req.path, "/cgi-bin/hello.py");
+    }
+
+    #[test]
+    fn case_insensitive_transfer_encoding_chunked_is_recognised() {
+        // Header names and token values are case-insensitive per RFC 9110
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nTRANSFER-ENCODING: Chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (progress, request) = parse_all(wire, 1024);
+        assert_eq!(progress, Progress::Complete);
+        assert_eq!(request.unwrap().body, b"hello");
+    }
 }

@@ -863,18 +863,21 @@ fn route_request(
     // the configured error page for that status by one path rather than each
     // handler inventing its own response.
     let outcome: Result<Reply, u16> = match router::resolve(server, request) {
-        Resolution::Redirect { status, location } => Ok(Reply::immediate(
-            Response::html(
-                status,
-                format!(
-                    "<!doctype html><html><head><meta charset=\"utf-8\">\
-                     <title>{status}</title></head><body>\
-                     <p>Moved to <a href=\"{location}\">{location}</a></p></body></html>\n"
-                ),
-            )
-            .header("Location", &location)
-            .head_only(head_only),
-        )),
+        Resolution::Redirect { status, location } => {
+            let escaped = crate::handlers::escape_html(&location);
+            Ok(Reply::immediate(
+                Response::html(
+                    status,
+                    format!(
+                        "<!doctype html><html><head><meta charset=\"utf-8\">\
+                         <title>{status}</title></head><body>\
+                         <p>Moved to <a href=\"{escaped}\">{escaped}</a></p></body></html>\n"
+                    ),
+                )
+                .header("Location", &location)
+                .head_only(head_only),
+            ))
+        }
 
         // RFC 9110 requires Allow on a 405 so the client learns what it may use.
         Resolution::MethodNotAllowed { allow } => {
@@ -970,6 +973,151 @@ mod tests {
         let text = String::from_utf8_lossy(&response.to_bytes(false)).to_string();
         assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(text.contains("Bad Request"));
+    }
+
+    // --- Status code 408: idle timeout must produce 408 when mid-request [A-34] ---
+
+    #[test]
+    fn idle_timeout_mid_request_yields_408_and_keeps_writing() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let sessions = Rc::new(RefCell::new(SessionStore::new(Duration::from_secs(60))));
+        let metrics = Rc::new(RefCell::new(Metrics::new()));
+        let servers: Rc<Vec<ServerConfig>> = Rc::new(vec![ServerConfig {
+            host: "127.0.0.1".to_string(),
+            ports: vec![8080],
+            server_names: Vec::new(),
+            is_default: true,
+            client_max_body_size: 1024 * 1024,
+            error_pages: std::collections::BTreeMap::new(),
+            routes: Vec::new(),
+            line: 1,
+        }]);
+
+        // Create a real TcpStream pair via loopback for the Connection constructor.
+        // We do not drive I/O; we only exercise timeout state machine.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (server_std, _) = listener.accept().unwrap();
+        server_std.set_nonblocking(true).unwrap();
+        let mio_stream = TcpStream::from_std(server_std);
+
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 12345));
+        let mut conn = Connection::new(
+            mio_stream,
+            peer,
+            Token(1 << 20),
+            1024 * 1024,
+            8080,
+            servers,
+            sessions,
+            metrics,
+        );
+
+        // Simulate a partial request: headers arrived but body not yet complete.
+        // Feed "GET / HTTP/1.1\r\nHost: x\r\n" (no terminator) via parser directly.
+        let mut parser = crate::http::request::RequestParser::new(1024 * 1024);
+        assert_eq!(
+            parser.feed(b"GET / HTTP/1.1\r\nHost: x\r\n"),
+            crate::http::request::Progress::NeedMore
+        );
+        // Inject parser state into a fresh connection by using feed through process path:
+        // Instead, test the timeout helper in isolation:
+        // - No activity for > IDLE_TIMEOUT and parser has buffered bytes → should be Idle.
+        conn = {
+            // Force created_at far in past to trigger hard timeout check first?
+            // We want Idle, not Hard, so set created_at recent but last_activity old.
+            // We cannot set private fields here, so test timeout logic directly:
+            // Create a connection with mocked instants via manipulating time.
+            // Simplest: verify Timeout::Idle when last_activity is old and created_at recent.
+            let mut c = conn;
+            c.parser.feed(b"GET / HTTP/1.1\r\nHost: x\r\n");
+            let now = Instant::now();
+            // Fresh connection: should be None
+            assert_eq!(c.timeout(now), Timeout::None);
+            // Simulate idle by moving last_activity back
+            // Use unsafe to poke private fields for test purposes (within same crate test)
+            c.last_activity = now - IDLE_TIMEOUT - Duration::from_secs(1);
+            // created_at still recent, so Idle, not Hard
+            assert_eq!(c.timeout(now), Timeout::Idle);
+            // Now trigger on_idle_timeout which should queue a 408
+            let action = c.on_idle_timeout();
+            assert_eq!(action, Action::Keep);
+            assert_eq!(c.state(), State::Writing);
+            // The queued response must be 408
+            let wire = String::from_utf8_lossy(&c.write_buf).to_string();
+            assert!(wire.contains("408"), "expected 408 in queued error, got: {wire}");
+            assert!(wire.contains("Request Timeout"));
+            c
+        };
+        // Verify the 408 response serializes correctly via error_bytes
+        assert!(conn.write_buf.starts_with(b"HTTP/1.1 408"));
+    }
+
+    #[test]
+    fn idle_keepalive_without_request_closes_silently_not_408() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let sessions = Rc::new(RefCell::new(SessionStore::new(Duration::from_secs(60))));
+        let metrics = Rc::new(RefCell::new(Metrics::new()));
+        let servers: Rc<Vec<ServerConfig>> = Rc::new(vec![]);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (server_std, _) = listener.accept().unwrap();
+        server_std.set_nonblocking(true).unwrap();
+        let mio_stream = TcpStream::from_std(server_std);
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 12346));
+        let mut conn = Connection::new(
+            mio_stream,
+            peer,
+            Token(1 << 20),
+            1024 * 1024,
+            8080,
+            servers,
+            sessions,
+            metrics,
+        );
+        // No request bytes at all, idle timeout should just Close (no 408)
+        let now = Instant::now();
+        conn.last_activity = now - IDLE_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(conn.timeout(now), Timeout::Idle);
+        assert_eq!(conn.on_idle_timeout(), Action::Close);
+    }
+
+    #[test]
+    fn hard_timeout_always_closes() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let sessions = Rc::new(RefCell::new(SessionStore::new(Duration::from_secs(60))));
+        let metrics = Rc::new(RefCell::new(Metrics::new()));
+        let servers: Rc<Vec<ServerConfig>> = Rc::new(vec![]);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (server_std, _) = listener.accept().unwrap();
+        server_std.set_nonblocking(true).unwrap();
+        let mio_stream = TcpStream::from_std(server_std);
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 12347));
+        let mut conn = Connection::new(
+            mio_stream,
+            peer,
+            Token(1 << 20),
+            1024 * 1024,
+            8080,
+            servers,
+            sessions,
+            metrics,
+        );
+        let now = Instant::now();
+        conn.created_at = now - REQUEST_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(conn.timeout(now), Timeout::Hard);
     }
 
     #[test]

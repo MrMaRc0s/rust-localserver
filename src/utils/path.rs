@@ -100,23 +100,25 @@ pub fn normalize_segments(path: &str) -> Result<Vec<String>, u16> {
     Ok(stack)
 }
 
+/// Map pre-normalized segments onto a filesystem path underneath `root`.
+pub fn resolve_segments_under(root: &Path, segments: &[String]) -> Result<PathBuf, u16> {
+    let mut path = root.to_path_buf();
+    for segment in segments {
+        path.push(segment);
+    }
+    verify_under(root, &path)?;
+    Ok(path)
+}
+
 /// Map a URL remainder onto a filesystem path underneath `root`.
 ///
 /// Returns 400 for a malformed or NUL-bearing path, 403 for a traversal
 /// attempt (lexical or via symlink).
+#[allow(dead_code)]
 pub fn resolve_under(root: &Path, url_remainder: &str) -> Result<PathBuf, u16> {
     let decoded = percent_decode(url_remainder)?;
     let segments = normalize_segments(&decoded)?;
-
-    let mut path = root.to_path_buf();
-    for segment in &segments {
-        // Safe by construction: every segment has been normalised and contains
-        // no separator, so this cannot escape `root` lexically.
-        path.push(segment);
-    }
-
-    verify_under(root, &path)?;
-    Ok(path)
+    resolve_segments_under(root, &segments)
 }
 
 /// Confirm that a resolved path really lives under `root` once symlinks are

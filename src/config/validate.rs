@@ -77,7 +77,10 @@ fn is_dir(path: &Path) -> bool {
 }
 
 fn is_readable_file(path: &Path) -> bool {
-    std::fs::File::open(path).is_ok()
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+        && std::fs::File::open(path).is_ok()
 }
 
 fn is_executable(path: &Path) -> bool {

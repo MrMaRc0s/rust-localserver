@@ -57,6 +57,18 @@ fn ensure_server() {
     SERVER.get_or_init(|| {
         let bin = env!("CARGO_BIN_EXE_localserver");
 
+        // If an earlier process just terminated, wait up to 2s for ports to release
+        for &port in &[8080, 8081, 8082] {
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(2) {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
         // Spawn server process configured with config.yaml
         let mut cmd = Command::new(bin);
         cmd.arg("config.yaml");
@@ -687,3 +699,46 @@ fn test_n_malformed_requests() {
     assert_eq!(resp2.status, 200);
     assert!(resp2.text().contains("LocalServer"));
 }
+
+#[test]
+fn test_o_admin_metrics() {
+    ensure_server();
+
+    // 1. GET /admin HTML dashboard
+    let resp_admin = request(8080, "GET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(resp_admin.status, 200);
+    assert_eq!(resp_admin.header("Content-Type"), Some("text/html; charset=utf-8"));
+    let html = resp_admin.text();
+    assert!(html.contains("Admin Dashboard"));
+    assert!(html.contains("Active Connections"));
+    assert!(html.contains("Open FDs"));
+
+    // 2. GET /admin/metrics.json
+    let resp_json = request(8080, "GET /admin/metrics.json HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(resp_json.status, 200);
+    assert_eq!(resp_json.header("Content-Type"), Some("application/json"));
+    let json = resp_json.text();
+    assert!(json.contains("\"uptime_seconds\":"));
+    assert!(json.contains("\"total_connections\":"));
+    assert!(json.contains("\"requests_total\":"));
+    assert!(json.contains("\"open_fds\":"));
+    assert!(json.contains("\"active_sessions\":"));
+}
+
+#[test]
+fn test_p_security_hardening() {
+    ensure_server();
+
+    // Test 1: Percent-encoded route prefix resolution (/%75ploads -> /uploads)
+    let resp_uploads = request(8080, "GET /%75ploads/ HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(resp_uploads.status, 200);
+
+    // Test 2: Redirect HTML escaping (prevent reflected HTML/XSS)
+    let resp_redir = request(8080, "GET /listing?foo=\"><script>alert(1)</script> HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(resp_redir.status, 301);
+    let body = resp_redir.text();
+    assert!(!body.contains("<script>alert(1)</script>"));
+    assert!(body.contains("&lt;script&gt;"));
+    assert!(body.contains("&quot;&gt;"));
+}
+

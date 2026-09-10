@@ -6,6 +6,8 @@
 //! exactly one `read` or one `write` syscall per ready token per iteration and
 //! never blocks. See `TASKS.md` for the phased implementation plan and
 //! `AUDIT_NOTES.md` for the line-referenced walkthrough.
+//! never blocks. See `docs/TASKS.md` for the phased implementation plan and
+//! `docs/AUDIT_NOTES.md` for the line-referenced walkthrough.
 
 mod cgi;
 mod config;

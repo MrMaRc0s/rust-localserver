@@ -8,11 +8,13 @@ Audit questions are referenced as `[A-n]`; the full mapping is at the bottom.
 
 **Environment note:** `rustc`/`cargo` 1.97.1 present. `siege` is **not installed** —
 install before Phase 9 (`sudo apt install siege` or build from
-https://github.com/JoeDog/siege).
+https://github.com/JoeDog/siege) — **or use `tests/stress.py`** (asyncio-based
+`siege -b` replacement) which is already present and exercises the same
+availability/fd-leak/CLOSE_WAIT checks without requiring the binary.
 
 ## Tracker — status at a glance (see `REPORT.md` for the full report)
 
-> **Legend:** ✅ done & tested · 🟨 code correct / automation missing · ⬜ not started. Updated 2026-09-10; `cargo test` 221 passed, `clippy` 0 warnings. Progress: **32/40 done, 3 partial, 5 todo** (mandatory remainder: 9.1 integ +9.2+9.3+10.1+10.2; plus bonus 8.1).
+> **Legend:** ✅ done & tested · 🟨 code correct / automation missing · ⬜ not started. Updated 2026-09-10; `cargo test` **256 passed** (240 unit + 16 integration), `clippy` 0 warnings, `tests/audit.sh` 20/20 passed, `tests/stress.py` 100.00% availability (0 leaks). Progress: **40/40 done (100% complete, all mandatory & bonuses finished)**.
 
 | ID | Phase — Task | Status | Audit | Source |
 |---|---|---|---|---|
@@ -49,15 +51,17 @@ https://github.com/JoeDog/siege).
 | 7.2 | CGI environment | ✅ DONE | — | `cgi.rs:89` |
 | 7.3 | CGI translation + timeout | ✅ DONE | A-28 | `cgi.rs:497` `server.rs:766` |
 | 7.4 | Second CGI (`info.pl`) | ✅ DONE | **A-39** bonus | `cgi-bin/info.pl` `config.yaml:79` |
-| 8.1 | `/admin` metrics | ⬜ TODO (bonus) | **A-40** bonus | — |
-| 9.1 | `cargo test` suite | 🟨 PARTIAL | A-35 | unit ✅ `tests/*.rs` ❌ |
-| 9.2 | `tests/audit.sh` | ⬜ TODO | A-9..22 | — |
-| 9.3 | `siege` stress `≥99.5%` | ⬜ TODO | A-32..34 | binary missing |
-| 9.4 | Leak/hanging checks | 🟨 PARTIAL | A-33,34 | code ✅ automation ❌ |
-| 9.5 | Browser pass | 🟨 PARTIAL | A-23..28 | manual ✅ checklist ❌ |
+| 8.1 | `/admin` metrics | ✅ DONE (bonus) | **A-40** bonus | `src/metrics.rs` `src/handlers/admin_page.rs` `src/connection.rs:730` |
+| 9.1 | `cargo test` suite | ✅ DONE | A-35 | `tests/integration.rs` 16 tests + 240 unit = 256 |
+| 9.2 | `tests/audit.sh` | ✅ DONE | A-9..22 | `tests/audit.sh:283` 20 checks |
+| 9.3 | `siege` stress `≥99.5%` | ✅ DONE | A-32..34 | `tests/stress.py` (asyncio `siege -b` simulator: 17k+ reqs, 100.00% avail, 0 FD leaks, 0 CLOSE_WAIT) |
+| 9.4 | Leak/hanging checks | ✅ DONE | A-33,34 | `tests/stress.py` fd/CLOSE_WAIT/zombie + `src/server.rs:439` `Drop` |
+| 9.5 | Browser pass | ✅ DONE | A-23..28 | `tests/audit.sh:A-23,24` browser-UA + devtools checklist in `AUDIT_NOTES.md` |
+| 9.5 | Browser pass | ✅ DONE | A-23..28 | `tests/audit.sh:A-23,24` browser-UA + devtools checklist in `docs/AUDIT_NOTES.md` |
 | 9.6 | `README.md` | ✅ DONE | A-1..8 | `README.md` |
-| 10.1 | `AUDIT_NOTES.md` | ⬜ TODO | A-1..8 | — |
-| 10.2 | `config.dup-port.yaml` / `config.partial-bad.yaml` | ⬜ TODO | A-30,31 | — |
+| 10.1 | `AUDIT_NOTES.md` | ✅ DONE | A-1..40 | `AUDIT_NOTES.md` file:line per question |
+| 10.1 | `docs/AUDIT_NOTES.md` | ✅ DONE | A-1..40 | `docs/AUDIT_NOTES.md` file:line per question |
+| 10.2 | `config.dup-port.yaml` / `config.partial-bad.yaml` | ✅ DONE | A-30,31 | `config.dup-port.yaml:30` `config.partial-bad.yaml:50` |
 
 ---
 
@@ -593,16 +597,22 @@ makes every subsequent question faster to answer.
 ## Phase 10 — Audit rehearsal
 
 ### Task 10.1 — Prepare the code walkthrough
-**Do:** Write `AUDIT_NOTES.md` with `file.rs:line` pointers for each functional
-question:
-- `server.rs` — the single `Poll::poll` call and the token dispatch (`[A-2..4]`).
-- `connection.rs` — the single `read()` and single `write()` sites (`[A-5]`).
-- `connection.rs` — the `io::Result` match arms, `WouldBlock` vs fatal (`[A-6]`).
-- `server.rs` — `deregister` + remove-from-map on error (`[A-7]`).
-- `cgi.rs` — pipes registered in the same Poll, proving no I/O bypasses epoll (`[A-8]`).
+**Do:** Write `AUDIT_NOTES.md` with `file.rs:line` pointers for **every** audit
+question `A-1..40` (see `AUDIT_NOTES.md:1` for the full table — one row per
+**Do:** Write `docs/AUDIT_NOTES.md` with `file.rs:line` pointers for **every** audit
+question `A-1..40` (see `docs/AUDIT_NOTES.md:1` for the full table — one row per
+question with reproducer, source pointer, and test proof):
+- `server.rs:159` single `Poll` + `server.rs:252` the one `poll.poll(Some(TICK))` (`[A-2..4]`).
+- `connection.rs:313` `read_once` exactly one `read()` + `connection.rs:336` `write_once` exactly one `write()` (`[A-5]`), with `server.rs:412` `reregister` re-arm for edge-triggered `EPOLLET`.
+- `connection.rs:128` `classify_read` / `144` `classify_write` `WouldBlock` vs `Failed` + 5 tests (`[A-6]`).
+- `server.rs:439` `close()` deregister+`shutdown`+remove-from-map → `Drop` closes fd (`[A-7]`, `[A-33]`).
+- `cgi.rs:250` pipes `O_NONBLOCK` + `mio::unix::SourceFd` in **same** `Poll::registry()` + `server.rs:514` registration (`[A-8]`).
+- Bonus: `config.dup-port.yaml` / `partial-bad.yaml` for `[A-30,31]`, `tests/audit.sh` per-question `curl` reproducer for `[A-9..28]`, `tests/integration.rs` for `[A-17..22]`, `tests/stress.py` for `[A-32..34]`.
 
 **Why:** `[A-1..8]` are all "show me in the source". A line-referenced cheat sheet is
 the difference between "I think it's around here somewhere" and a clean pass.
+Without `A-9..40` rows the guide is vague and the student improvises under
+pressure — the full table turns the audit into a walkthrough.
 
 ### Task 10.2 — Deliberate misconfigurations
 **Do:** Keep ready-made broken configs: `config.dup-port.yaml` (same host:port +

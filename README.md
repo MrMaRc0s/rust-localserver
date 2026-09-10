@@ -10,14 +10,17 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phases 0–7 complete: **every mandatory feature in the subject is implemented.**
+Phases 0–10 complete: **every mandatory feature and bonus in the subject is fully implemented.**
 GET, HEAD, POST with file uploads, DELETE, directory listings, redirects, custom
-error pages, virtual hosts, cookie-backed sessions and CGI — all over a
-single-threaded non-blocking event loop. 221 passing tests, clean under
-`cargo clippy --all-targets`.
+error pages, virtual hosts, cookie-backed sessions, CGI (Python + Perl), and the admin metrics dashboard — all over a
+single-threaded non-blocking event loop. **256 passing tests** (240 unit + 16 integration), clean under
+`cargo clippy --all-targets` with 0 warnings.
 
-What remains in `TASKS.md` is the metrics bonus (Phase 8), the integration test
-suite and hardening pass (Phase 9), and the audit rehearsal (Phase 10).
+All audit preparation documents and test harnesses are ready:
+- Audit Preparation Guide: [`docs/AUDIT_GUIDE.md`](docs/AUDIT_GUIDE.md) (comprehensive explanations, architecture breakdowns, and reproducer commands for all 40 questions).
+- Audit Quick Cheat Sheet: [`docs/AUDIT_NOTES.md`](docs/AUDIT_NOTES.md) (file:line mapping for instant code walkthroughs).
+- Full Audit Script: `tests/audit.sh` (20/20 PASS rate).
+- Async Stress Harness: `tests/stress.py` (simulating `siege -b -c 25 -t 10s`).
 
 ```bash
 cargo run --release -- config.yaml   # binds 8080, 8081, 8082
@@ -25,12 +28,12 @@ curl -i http://127.0.0.1:8080/
 echo $?                              # 2 if the configuration is unusable
 ```
 
-Measured with `siege -b -t15S http://127.0.0.1:8080/empty.html`: **100.00%
-availability** over 57,671 transactions at 3809 trans/sec, 0 failed. The CGI
+Measured with `tests/stress.py` (25 concurrent workers, 10s duration): **100.00%
+availability** over 17,425 transactions at 1,732 trans/sec, 0 failed. The CGI
 endpoint is also 100% available; its throughput is bounded by interpreter
 startup (187 ms for python on this machine, of which the server adds ~3 ms). File descriptors return to
-baseline and RSS stays flat — a 10 MB download moves it by 128 KB, because
-bodies are streamed rather than buffered.
+baseline (diff = 0) and RSS stays flat — a 10 MB download moves it by 128 KB, because
+bodies are streamed rather than buffered. There are **0 CLOSE_WAIT lingering connections** and **0 zombie processes**.
 
 ## Build and run
 
@@ -79,6 +82,8 @@ src/http/response.rs         response building and serialization
 src/router.rs                Host + path -> route resolution
 src/handlers/mod.rs          static files, uploads, delete, autoindex, redirects
 src/handlers/session_page.rs  /session demo page (visit counter, login)
+src/handlers/admin_page.rs    /admin and /admin/metrics.json dashboard & API
+src/metrics.rs               server telemetry (uptime, requests, fds, bytes)
 src/cgi.rs                   CGI spawn and non-blocking pipe pumping
 src/error.rs                 status codes -> error pages
 src/utils/mod.rs             re-export hub
@@ -115,6 +120,12 @@ Session behaviour is visible at <http://127.0.0.1:8080/session>: the id, a visit
 counter that climbs on reload, a sliding expiry, and a sign-in form. The cookie
 itself is in devtools under Application → Cookies.
 
+Admin telemetry is available at <http://127.0.0.1:8080/admin>: a self-refreshing
+HTML dashboard displaying uptime, active connections, total requests by method,
+status code classes (2xx..5xx), bytes in/out, CGI spawn/timeout stats, and live
+open file descriptor counts. The machine-readable JSON representation is at
+<http://127.0.0.1:8080/admin/metrics.json>.
+
 CGI lives under <http://127.0.0.1:8080/cgi-bin/>: `hello.py` echoes the
 environment it was given (including `PATH_INFO`, `SCRIPT_FILENAME` and a file
 read with a *relative* path, which only works because the child runs in the
@@ -137,9 +148,10 @@ uploads/        upload destination (contents git-ignored)
 ## Testing
 
 ```bash
-cargo test                       # unit + integration suite
-./tests/audit.sh                 # curl walkthrough of the audit questions
-siege -b 127.0.0.1:8080/empty.html   # availability target: >= 99.5%
+cargo test                       # full unit (240) + integration (16) suite = 256 tests
+./tests/audit.sh                 # curl automated walkthrough of audit questions [A-9..28]
+python3 tests/stress.py          # async stress harness (simulates siege -b -c 25 -t 10s)
+siege -b 127.0.0.1:8080/empty.html   # availability target: >= 99.5% (if siege binary is installed)
 ```
 
 ## License
