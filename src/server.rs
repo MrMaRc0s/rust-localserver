@@ -42,6 +42,7 @@ use std::rc::Rc;
 use std::io;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use mio::event::Event;
@@ -149,6 +150,7 @@ pub struct Server {
     cgi_pipes: HashMap<Token, Token>,
     next_cgi_token: usize,
     free_cgi_tokens: Vec<usize>,
+    pending_reap: Vec<Child>,
 }
 
 impl Server {
@@ -248,6 +250,7 @@ impl Server {
             cgi_pipes: HashMap::new(),
             next_cgi_token: CGI_TOKEN_BASE,
             free_cgi_tokens: Vec::new(),
+            pending_reap: Vec::new(),
         })
     }
 
@@ -378,10 +381,12 @@ impl Server {
             };
 
             let mut action = Action::Keep;
-            if event.is_readable() {
+            if event.is_readable() || event.is_read_closed() {
                 action = connection.on_readable();
             } else if event.is_writable() {
                 action = connection.on_writable();
+            } else if event.is_error() || event.is_write_closed() {
+                action = Action::Close;
             }
             Some((action, connection.desired_interest(), connection.take_rearm()))
         }));
@@ -711,20 +716,32 @@ impl Server {
         };
         self.release_cgi_pipes(&mut process);
 
-        // waitpid(WNOHANG): report the exit without waiting for it, so a script
-        // that has finished does not linger as a zombie.
-        let code = process.reap();
         let stderr = process.stderr_text();
         if !stderr.is_empty() {
             eprintln!("localserver: CGI stderr: {stderr}");
         }
-        if let Some(code) = code {
-            if code != 0 {
-                eprintln!("localserver: CGI exited with status {code}");
+
+        let (response, child_opt) = process.into_response_and_child();
+        if let Some(mut child) = child_opt {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = status.code().unwrap_or(-1);
+                    if code != 0 {
+                        eprintln!("localserver: CGI exited with status {code}");
+                    }
+                }
+                Ok(None) => {
+                    self.pending_reap.push(child);
+                }
+                Err(e) => {
+                    // ECHILD (os error 10) means another reaping call (e.g. waitpid) already reaped it.
+                    if e.raw_os_error() != Some(10) {
+                        eprintln!("localserver: CGI try_wait error: {e}");
+                    }
+                }
             }
         }
 
-        let response = process.into_response();
         self.wake_connection(connection, Reply::immediate(response));
     }
 
@@ -792,6 +809,25 @@ impl Server {
     /// Without this an infinite loop in a script is a permanent process and
     /// three permanent file descriptors ([A-33], [A-34]).
     fn sweep_cgi(&mut self) {
+        // Non-blocking reap of background child processes to prevent zombies ([A-34]).
+        self.pending_reap.retain_mut(|child| {
+            match child.try_wait() {
+                Ok(Some(_)) => false, // Reaped!
+                Ok(None) => true,     // Still exiting, check on subsequent tick
+                Err(_) => false,      // Errored or gone
+            }
+        });
+
+        // Extra defense-in-depth: reap any exited child process via non-blocking waitpid
+        loop {
+            let mut status = 0;
+            // SAFETY: waitpid with WNOHANG and -1 is safe and non-blocking.
+            let res = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if res <= 0 {
+                break;
+            }
+        }
+
         if self.cgi.is_empty() {
             return;
         }

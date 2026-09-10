@@ -14,7 +14,7 @@ availability/fd-leak/CLOSE_WAIT checks without requiring the binary.
 
 ## Tracker — status at a glance (see `REPORT.md` for the full report)
 
-> **Legend:** ✅ done & tested · 🟨 code correct / automation missing · ⬜ not started. Updated 2026-09-10; `cargo test` **256 passed** (240 unit + 16 integration), `clippy` 0 warnings, `tests/audit.sh` 20/20 passed, `tests/stress.py` 100.00% availability (0 leaks). Progress: **40/40 done (100% complete, all mandatory & bonuses finished)**.
+> **Legend:** ✅ done & tested · 🟨 code correct / automation missing · ⬜ not started. Updated 2026-09-10; `cargo test` **262 passed** (246 unit + 16 integration), `clippy` 0 warnings, `tests/audit.sh` 20/20 passed, `tests/stress.py` 100.00% availability (0 leaks). Progress: **40/40 done (100% complete, all mandatory & bonuses finished)**.
 
 | ID | Phase — Task | Status | Audit | Source |
 |---|---|---|---|---|
@@ -29,7 +29,7 @@ availability/fd-leak/CLOSE_WAIT checks without requiring the binary.
 | 2.3 | Accept loop | ✅ DONE | A-20 | `src/server.rs:288` |
 | 2.4 | One read/write per event | ✅ DONE | A-5 | `src/connection.rs:303` |
 | 2.5 | Error & client removal | ✅ DONE | A-6,7,33 | `connection.rs:126` `server.rs:439` |
-| 2.6 | Timeouts | ✅ DONE | A-34 | `connection.rs:614` `server.rs:819` |
+| 2.6 | Timeouts | ✅ DONE | A-34 | `connection.rs:614` `server.rs:847` |
 | 2.7 | Never crash | ✅ DONE | A-20 | `server.rs:165,367` `connection.rs:63` |
 | 3.1 | Request line + headers | ✅ DONE | A-36 | `src/http/request.rs` |
 | 3.2 | Body: CL + chunked | ✅ DONE | A-13,28 | `request.rs:299` `chunked.rs` |
@@ -52,7 +52,7 @@ availability/fd-leak/CLOSE_WAIT checks without requiring the binary.
 | 7.3 | CGI translation + timeout | ✅ DONE | A-28 | `cgi.rs:497` `server.rs:766` |
 | 7.4 | Second CGI (`info.pl`) | ✅ DONE | **A-39** bonus | `cgi-bin/info.pl` `config.yaml:79` |
 | 8.1 | `/admin` metrics | ✅ DONE (bonus) | **A-40** bonus | `src/metrics.rs` `src/handlers/admin_page.rs` `src/connection.rs:730` |
-| 9.1 | `cargo test` suite | ✅ DONE | A-35 | `tests/integration.rs` 16 tests + 240 unit = 256 |
+| 9.1 | `cargo test` suite | ✅ DONE | A-35 | `tests/integration.rs` 16 tests + 246 unit = 262 |
 | 9.2 | `tests/audit.sh` | ✅ DONE | A-9..22 | `tests/audit.sh:283` 20 checks |
 | 9.3 | `siege` stress `≥99.5%` | ✅ DONE | A-32..34 | `tests/stress.py` (asyncio `siege -b` simulator: 17k+ reqs, 100.00% avail, 0 FD leaks, 0 CLOSE_WAIT) |
 | 9.4 | Leak/hanging checks | ✅ DONE | A-33,34 | `tests/stress.py` fd/CLOSE_WAIT/zombie + `src/server.rs:439` `Drop` |

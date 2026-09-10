@@ -13,7 +13,7 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 Phases 0–10 complete: **every mandatory feature and bonus in the subject is fully implemented.**
 GET, HEAD, POST with file uploads, DELETE, directory listings, redirects, custom
 error pages, virtual hosts, cookie-backed sessions, CGI (Python + Perl), and the admin metrics dashboard — all over a
-single-threaded non-blocking event loop. **256 passing tests** (240 unit + 16 integration), clean under
+single-threaded non-blocking event loop. **262 passing tests** (246 unit + 16 integration), clean under
 `cargo clippy --all-targets` with 0 warnings.
 
 All audit preparation documents and test harnesses are ready:
@@ -148,7 +148,7 @@ uploads/        upload destination (contents git-ignored)
 ## Testing
 
 ```bash
-cargo test                       # full unit (240) + integration (16) suite = 256 tests
+cargo test                       # full unit (246) + integration (16) suite = 262 tests
 ./tests/audit.sh                 # curl automated walkthrough of audit questions [A-9..28]
 python3 tests/stress.py          # async stress harness (simulates siege -b -c 25 -t 10s)
 siege -b 127.0.0.1:8080/empty.html   # availability target: >= 99.5% (if siege binary is installed)

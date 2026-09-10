@@ -11,7 +11,7 @@ This document is the merged, definitive code-pointer cheat sheet for auditing **
 ## 1. Rehearsal Checklist (Run Before Handing Laptop to Auditor)
 
 ```bash
-# 1. Verify tests pass (256 passed: 240 unit + 16 integration)
+# 1. Verify tests pass (262 passed: 246 unit + 16 integration)
 cargo test
 
 # 2. Verify clean linter (0 warnings)
@@ -104,8 +104,8 @@ Open Google Chrome or Firefox and navigate to `http://127.0.0.1:8080/`:
 | **A-31** | Partial bad config | `src/config/validate.rs:334-352` | `cargo run -- config.partial-bad.yaml` | Two-severity design: bad dropped, good servers serve |
 | **A-32** | Siege availability >=99.5% | `tests/stress.py:268-274` | `python3 tests/stress.py` | 100.00% availability over 17,000+ transactions |
 | **A-33** | No memory leaks | `tests/stress.py:276-285` | `ls /proc/$PID/fd \| wc -l` | Baseline FDs = 7, Final FDs = 7 (diff = 0) |
-| **A-34** | No hanging connections | `src/server.rs:819-860`<br>`tests/stress.py:287` | `ss -tan \| grep 8080` | Dual 30s idle / 60s total timeouts; 0 CLOSE_WAIT |
-| **A-35** | `cargo test` all pass | `tests/integration.rs`<br>`src/**/tests.rs` | `cargo test` | 256 passed (240 unit + 16 integration) |
+| **A-34** | No hanging connections | `src/server.rs:847-893`<br>`tests/stress.py:287` | `ss -tan \| grep 8080` | Dual 30s idle / 60s total timeouts; 0 CLOSE_WAIT |
+| **A-35** | `cargo test` all pass | `tests/integration.rs`<br>`src/**/tests.rs` | `cargo test` | 262 passed (246 unit + 16 integration) |
 | **A-36** | HTTP parser tests | `src/http/request.rs:560-890` | `cargo test http::request` | 33 request + 12 chunked unit tests |
 | **A-37** | Config validation tests | `src/config/validate.rs:366-697` | `cargo test config::validate` | 21 validate + 20 parser unit tests |
 | **A-38** | Route matching tests | `src/router.rs:306-440` | `cargo test router::tests` | 25 router unit tests |
@@ -177,13 +177,13 @@ Open Google Chrome or Firefox and navigate to `http://127.0.0.1:8080/`:
 |---|---|---|
 | **A-32** (Siege availability >=99.5%) | `tests/stress.py:268-274` | Run `python3 tests/stress.py`: 100.00% availability over 17,000+ transactions at 1,732 req/s. |
 | **A-33** (No memory / FD leaks) | `tests/stress.py:276-285` | Samples `/proc/$PID/fd` before and after test: baseline = 7, final = 7 (diff = 0). Proves zero FD leaks. |
-| **A-34** (No hanging connections) | `src/server.rs:819-860`<br>`tests/stress.py:287` | Dual timeouts: 30s idle and 60s hard deadline. `ss -tan | grep 8080` shows 0 `CLOSE_WAIT` connections. |
+| **A-34** (No hanging connections) | `src/server.rs:847-893`<br>`tests/stress.py:287` | Dual timeouts: 30s idle and 60s hard deadline. `ss -tan | grep 8080` shows 0 `CLOSE_WAIT` connections. |
 
 ### 4.7 Test Suites & Bonus Features (A-35..A-40)
 
 | Question | Source Pointer | What to Point at & Explain |
 |---|---|---|
-| **A-35** (`cargo test` all pass) | `tests/integration.rs` | 256 tests passing (240 unit + 16 live TCP integration tests). |
+| **A-35** (`cargo test` all pass) | `tests/integration.rs` | 262 tests passing (246 unit + 16 live TCP integration tests). |
 | **A-36** (HTTP parser tests) | `src/http/request.rs:560-890` | 33 unit tests for method parsing, headers, chunked framing, limits, malformed syntax. |
 | **A-37** (Config validation tests) | `src/config/validate.rs:366-697` | 21 validate + 20 parser unit tests covering syntax errors, duplicate ports, and body sizes. |
 | **A-38** (Route matching tests) | `src/router.rs:306-440` | 25 unit tests covering longest prefix, method permissions, index, autoindex, traversal. |

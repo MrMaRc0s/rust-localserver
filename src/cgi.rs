@@ -220,7 +220,7 @@ pub enum CgiStep {
 
 /// A running script and its three pipes.
 pub struct CgiProcess {
-    child: Child,
+    child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
@@ -291,7 +291,7 @@ impl CgiProcess {
         }
 
         Ok(CgiProcess {
-            child,
+            child: Some(child),
             stdin,
             stdout,
             stderr,
@@ -439,11 +439,14 @@ impl CgiProcess {
     }
 
     /// `waitpid(WNOHANG)`: has it exited, without waiting for it to.
+    /// Kept for unit tests / direct callers; the loop now reaps via
+    /// `into_response_and_child` + `pending_reap`.
+    #[allow(dead_code)]
     pub fn reap(&mut self) -> Option<i32> {
-        match self.child.try_wait() {
+        self.child.as_mut().and_then(|c| match c.try_wait() {
             Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
             _ => None,
-        }
+        })
     }
 
     /// Kill for a script that overran its deadline. Non-blocking: only
@@ -451,9 +454,11 @@ impl CgiProcess {
     /// on the next loop tick so the single thread never stalls in `wait()`.
     pub fn kill(&mut self) {
         self.finished = true;
-        let _ = self.child.kill();
-        // Best-effort non-blocking reap; the tick's `reap()` collects the rest.
-        let _ = self.child.try_wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            // Best-effort non-blocking reap; the tick's `reap()` collects the rest.
+            let _ = child.try_wait();
+        }
     }
 
     pub fn stderr_text(&self) -> String {
@@ -461,8 +466,17 @@ impl CgiProcess {
     }
 
     /// Turn what the script wrote into an HTTP response.
+    /// Kept for unit tests; the loop uses `into_response_and_child`.
+    #[allow(dead_code)]
     pub fn into_response(self) -> Response {
         translate(&self.output, self.head_only)
+    }
+
+    /// Turn what the script wrote into an HTTP response and return the Child handle
+    /// so the event loop can reap it asynchronously without blocking or leaking zombies.
+    pub fn into_response_and_child(mut self) -> (Response, Option<Child>) {
+        let resp = translate(&self.output, self.head_only);
+        (resp, self.child.take())
     }
 }
 
@@ -471,8 +485,10 @@ impl Drop for CgiProcess {
     /// Non-blocking: never `wait()` here, the loop tick reaps via `try_wait`.
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.try_wait();
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.try_wait();
+            }
         }
     }
 }

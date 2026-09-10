@@ -502,7 +502,7 @@ This guide is your complete reference manual for passing the **LocalServer** eva
   - **Hard request timeout (60 seconds)**: Unconditionally terminates any connection that stalls.
   - Socket table inspection (`ss -tan | grep 8080`) confirms zero lingering `CLOSE_WAIT` connections."
 - **Code Location**:
-  - Sweep timeouts: `src/server.rs:819-860`
+  - Sweep timeouts: `src/server.rs:847-893`
 - **Live Demo**:
   ```bash
   ss -tan | grep 8080
@@ -514,7 +514,7 @@ This guide is your complete reference manual for passing the **LocalServer** eva
 
 ### Q35: Do all tests pass without errors?
 - **Verbal Answer**:
-  "Yes. Running `cargo test` executes 256 tests (240 unit tests across all modules + 16 end-to-end integration tests), all passing with 0 failures."
+  "Yes. Running `cargo test` executes 262 tests (246 unit tests across all modules + 16 end-to-end integration tests), all passing with 0 failures."
 - **Live Demo**:
   ```bash
   cargo test

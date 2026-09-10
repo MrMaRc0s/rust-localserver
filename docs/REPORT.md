@@ -6,7 +6,7 @@
 
 | Signal | Value |
 |---|---|
-| `cargo test` | **256 passed, 0 failed** (240 unit + 16 integration tests in `tests/integration.rs`) |
+| `cargo test` | **262 passed, 0 failed** (246 unit + 16 integration tests in `tests/integration.rs`) |
 | `cargo clippy --all-targets` | **0 warnings** (across bin, tests, integration) |
 | `cargo build --release` | ok, `panic = "unwind"` (`Cargo.toml:24`) for `catch_unwind` in `src/server.rs:367` |
 | Dependencies | `mio 1` (`os-poll`+`net`+`os-ext` for `SourceFd` in `src/cgi.rs:17`/`src/server.rs:49`) + `libc` only |
@@ -34,7 +34,7 @@ All Phases 0 through 10 are fully implemented, defensively hardened, and verifie
 - Accept drain loop on listeners until `WouldBlock`, `TCP_NODELAY`, connection throttling at 512.
 - **Strict single read or write per poll tick** (`src/server.rs:374-380`), mutually exclusive `else if` branch.
 - Return values checked exhaustively (`src/connection.rs:126-155`), non-fatal `WouldBlock` ignored, fatal errors trigger client removal and RAII fd drop.
-- Dual timeouts: 30s idle (408 if mid-request) and 60s hard close (`src/server.rs:819`).
+- Dual timeouts: 30s idle (408 if mid-request) and 60s hard close (`src/server.rs:847`).
 - Crash resilience: `SIGPIPE` ignored (`src/server.rs:166`), per-client `catch_unwind` isolation (`src/server.rs:367`).
 
 ### Phase 3 — HTTP Parsing — DONE (`A-20,28,36`)
@@ -127,7 +127,7 @@ All Phases 0 through 10 are fully implemented, defensively hardened, and verifie
 | 7.3 | CGI translation + timeout | ✅ DONE | A-28 | `src/cgi.rs:497`, `src/server.rs:784` |
 | 7.4 | Second CGI (`info.pl`) | ✅ DONE | **A-39** bonus | `cgi-bin/info.pl`, `config.yaml:79` |
 | 8.1 | `/admin` metrics | ✅ DONE | **A-40** bonus | `src/metrics.rs`, `src/handlers/admin_page.rs` |
-| 9.1 | `cargo test` suite | ✅ DONE | A-35 | 256 passed (`src/**/tests.rs` + `tests/integration.rs`) |
+| 9.1 | `cargo test` suite | ✅ DONE | A-35 | 262 passed (`src/**/tests.rs` + `tests/integration.rs`) |
 | 9.2 | `tests/audit.sh` | ✅ DONE | A-9..28 | 20 passed, 0 failed |
 | 9.3 | Stress availability >=99.5%| ✅ DONE | A-32..34 | 100.00% availability via `tests/stress.py` |
 | 9.4 | Leak/hanging checks | ✅ DONE | A-33,34 | 0 FD leak, 0 CLOSE_WAIT, 0 zombies |

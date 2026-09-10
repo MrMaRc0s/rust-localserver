@@ -19,6 +19,30 @@ numbering in `TASKS.md`.
 
 ## [Unreleased]
 
+### Fixed & Security — Adversarial Audit Hardening (2026-09-10)
+
+- **HEAD on 405 + `/session` now omits body** (`src/connection.rs`):
+  - `Resolution::MethodNotAllowed` and `session_demo` apply `.head_only(head_only)`.
+  - _Why:_ RFC 9110 §9.3.2 — HEAD MUST NOT send a body; previously `curl -I` on `/readonly/*` or `/session` returned bytes, risking keep-alive desync. [A-24]
+- **Non-blocking CGI teardown** (`src/cgi.rs`):
+  - `kill()` and `Drop` use `try_wait()` (WNOHANG) only; reaping stays on the loop tick.
+  - _Why:_ blocking `wait()` on the single thread stalls every client if a child is slow to die. [A-8, A-33]
+- **`dispatch_cgi` panic isolation + readiness gating** (`src/server.rs`):
+  - `dispatch_cgi` wrapped in `catch_unwind` → 502 + close (mirrors `dispatch`); stdout/stderr gated on `is_readable()||is_error()`; client dispatch closes on `is_error()/is_write_closed()`.
+  - _Why:_ a CGI bug must cost one client, not the process; spurious error events must not trigger reads. [A-20]
+- **Request parser hardening** (`src/http/request.rs`):
+  - `Transfer-Encoding` requires `chunked` final (else 501); `Content-Length` requires `1*DIGIT` (rejects `+5`); `Host: name:garbage-port` rejected with 400.
+  - _Why:_ closes smuggling/framing disagreements where lenient vs strict parsers diverge. [A-20, A-36]
+- **Upload symlink guard** (`src/handlers/mod.rs`):
+  - `write_file` refuses `403` when the destination is a symlink.
+  - _Why:_ prevents `uploads/link -> /outside` redirecting an upload outside the configured directory. [A-21]
+- **Filename `a..b` allowed** (`src/http/multipart.rs`):
+  - `sanitize_filename` only rejects `.`/`..` themselves and leading-dot hidden files, not `..` substrings.
+  - _Why:_ `a..b` is a harmless single component; over-rejection breaks legit uploads. [A-21]
+- **Lint coverage extended**: `#![deny(clippy::unwrap_used, expect_used)]` added to `config/*`, `main.rs`, `http/mod.rs`, `utils/{mime,mod}.rs`.
+  - _Why:_ makes "no panics on the request path" enforced rather than intended. [A-20]
+- **6 new regression tests** (246 unit + 16 integration = 262 total): non-final chunked, signed CL, bad Host port, `a..b` filename, symlink upload refusal.
+
 ### Added
 
 - **Phase 8.1 / [A-40] Bonus — Admin Dashboard & Metrics Endpoint** (`src/metrics.rs`, `src/handlers/admin_page.rs`, `src/server.rs`, `src/connection.rs`):
