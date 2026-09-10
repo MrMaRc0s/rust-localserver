@@ -695,6 +695,18 @@ fn build_reply(
     port: u16,
     cgi: &mut Option<Box<CgiSpec>>,
 ) -> Reply {
+    // CORS preflight: browsers send `OPTIONS` with Access-Control-Request-*
+    // before non-simple cross-origin fetches (custom headers like X-Host,
+    // or Content-Type: application/octet-stream). Answer 204 with Allow so
+    // the visual audit dashboard can probe 8081/8082 from a page on 8080.
+    // Handled here (not in route_request) so /session and /admin preflights
+    // also succeed. `to_bytes` adds the Access-Control-Allow-* headers.
+    if request.method_enum() == Some(Method::Options) {
+        return Reply::immediate(
+            Response::new(204).header("Allow", "GET, POST, DELETE, HEAD, OPTIONS"),
+        );
+    }
+
     let session = resolve_session(sessions, request);
 
     let mut reply = if admin_page::owns(&request.path) {

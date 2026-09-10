@@ -1,1 +1,0 @@
-../../static/audit-console.js

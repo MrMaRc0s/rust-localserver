@@ -901,6 +901,12 @@ fn test_u_vhost_host_and_xhost_parity() {
     let via_xhost = request(8080, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Host: test.com\r\nConnection: close\r\n\r\n");
     assert_eq!(via_xhost.status, 200);
     assert!(via_xhost.text().contains("test.com"), "X-Host: test.com must also serve site2 (visual workaround)");
+
+    // site2 static assets must be servable (regression: /static/* was 404 on
+    // test.com because www/site2/static/ did not exist → unstyled page).
+    let css = request(8080, "GET /static/style.css HTTP/1.1\r\nHost: test.com\r\nConnection: close\r\n\r\n");
+    assert_eq!(css.status, 200, "test.com /static/style.css must be servable");
+    assert!(css.header("content-type").unwrap_or("").contains("text/css"));
 }
 
 /// Dashboard coherence (no server needed): every `getElementById` / `res-*`
@@ -1035,11 +1041,13 @@ fn test_w_visual_dashboard_correctness() {
     );
 
     // Virtual-host static isolation: test.com root is www/site2, so
-    // /static/* on that vhost needs www/site2/static/* to exist.
-    assert!(
-        root.join("www/site2/static/style.css").is_file() || root.join("www/site2/static").is_symlink(),
-        "www/site2/static/style.css missing — test.com page renders unstyled"
-    );
+    // /static/* on that vhost needs www/site2/static/* as REAL files.
+    // Symlinks pointing outside www/site2 (e.g. -> ../../static/...) are
+    // correctly refused with 403 by the symlink defence (verify_under), so
+    // they must be copies, not symlinks.
+    let site_css = root.join("www/site2/static/style.css");
+    assert!(site_css.is_file(), "www/site2/static/style.css missing — test.com page renders unstyled");
+    assert!(!site_css.is_symlink(), "www/site2/static/style.css must be a copy, not an outside-root symlink (would 403)");
 
     // [A-14] a14 must cover all 6 routes, including /readonly and /old-page.
     let a14 = fn_body(&js, "a14");
