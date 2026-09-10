@@ -227,7 +227,7 @@ fn store_raw(dir: &Path, request: &Request, url_path: &str) -> Result<String, u1
 fn generated_name(request: &Request) -> String {
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let extension = match request.headers.get("content-type").unwrap_or("") {
         t if t.starts_with("text/plain") => "txt",
@@ -330,7 +330,7 @@ pub fn listing(dir: &Path, url_path: &str, head_only: bool) -> Result<Reply, u16
 }
 
 /// Escape text for HTML content and attribute values.
-fn escape_html(input: &str) -> String {
+pub fn escape_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
         match c {

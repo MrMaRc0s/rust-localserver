@@ -18,6 +18,7 @@ servers:
         methods:
           - GET
         root: www
+        index: index.html
 
   - host: 127.0.0.1
     ports:
@@ -31,6 +32,7 @@ servers:
         methods:
           - GET
         root: /nonexistent_path_xyz
+        index: index.html
 
   - host: 127.0.0.1
     ports:
@@ -45,3 +47,4 @@ servers:
         methods:
           - GET
         root: www/site2
+        index: index.html

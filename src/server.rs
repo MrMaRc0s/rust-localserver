@@ -265,7 +265,6 @@ impl Server {
 
             for event in events.iter() {
                 let token = event.token();
-                eprintln!("DEBUG EVENT: token={:?} readable={} writable={}", token, event.is_readable(), event.is_writable());
                 if token.0 < CONNECTION_TOKEN_BASE {
                     self.accept_from(token);
                 } else if token.0 < CGI_TOKEN_BASE {
@@ -322,15 +321,7 @@ impl Server {
             };
 
             self.metrics.borrow_mut().record_connection_open();
-            self.register_connection(
-                socket,
-                peer,
-                max_body,
-                port,
-                servers,
-                sessions,
-                Rc::clone(&self.metrics),
-            );
+            self.register_connection(socket, peer, max_body, port, servers, sessions);
         }
     }
 
@@ -342,7 +333,6 @@ impl Server {
         port: u16,
         servers: Rc<Vec<ServerConfig>>,
         sessions: Rc<RefCell<SessionStore>>,
-        metrics: Rc<RefCell<Metrics>>,
     ) {
         // Small responses should leave immediately rather than waiting for
         // Nagle to coalesce them with data that will never come.
@@ -364,6 +354,7 @@ impl Server {
             return;
         }
 
+        let metrics = Rc::clone(&self.metrics);
         self.connections
             .insert(
                 token,

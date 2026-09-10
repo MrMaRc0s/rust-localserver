@@ -250,6 +250,7 @@ impl Connection {
     /// `max_body` is the largest body any server on this listener accepts. The
     /// selected virtual host's own, stricter limit is applied once the `Host`
     /// header has been read (TASKS.md 4.1).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         socket: TcpStream,
         peer: SocketAddr,
@@ -969,5 +970,70 @@ mod tests {
         let text = String::from_utf8_lossy(&response.to_bytes(false)).to_string();
         assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(text.contains("Bad Request"));
+    }
+
+    #[test]
+    fn build_reply_routes_admin_dashboard_and_metrics() {
+        let sessions = Rc::new(RefCell::new(SessionStore::new(Duration::from_secs(60))));
+        let metrics = Rc::new(RefCell::new(Metrics::new()));
+        let mut spec = None;
+        let remote = "127.0.0.1:12345".parse().unwrap();
+
+        // 1. GET /admin
+        let mut parser = RequestParser::new(4096);
+        assert_eq!(
+            parser.feed(b"GET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Progress::Complete
+        );
+        let req = parser.take().unwrap();
+        let reply = build_reply(&[], &sessions, &metrics, &req, remote, 8080, &mut spec);
+        assert_eq!(reply.response.status, 200);
+        assert_eq!(
+            reply.response.get_header("Content-Type"),
+            Some("text/html; charset=utf-8")
+        );
+        let body = String::from_utf8_lossy(&reply.response.body);
+        assert!(body.contains("Admin Dashboard"));
+
+        // 2. GET /admin/metrics.json
+        let mut parser = RequestParser::new(4096);
+        assert_eq!(
+            parser.feed(b"GET /admin/metrics.json HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Progress::Complete
+        );
+        let req = parser.take().unwrap();
+        let reply = build_reply(&[], &sessions, &metrics, &req, remote, 8080, &mut spec);
+        assert_eq!(reply.response.status, 200);
+        assert_eq!(
+            reply.response.get_header("Content-Type"),
+            Some("application/json")
+        );
+        let body = String::from_utf8_lossy(&reply.response.body);
+        assert!(body.contains("\"uptime_seconds\":"));
+
+        // 3. POST /admin is 405 Method Not Allowed
+        let mut parser = RequestParser::new(4096);
+        assert_eq!(
+            parser.feed(b"POST /admin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"),
+            Progress::Complete
+        );
+        let req = parser.take().unwrap();
+        let reply = build_reply(&[], &sessions, &metrics, &req, remote, 8080, &mut spec);
+        assert_eq!(reply.response.status, 405);
+        assert_eq!(reply.response.get_header("Allow"), Some("GET, HEAD"));
+
+        // 4. HEAD /admin returns 200 with head_only set
+        let mut parser = RequestParser::new(4096);
+        assert_eq!(
+            parser.feed(b"HEAD /admin HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Progress::Complete
+        );
+        let req = parser.take().unwrap();
+        let reply = build_reply(&[], &sessions, &metrics, &req, remote, 8080, &mut spec);
+        assert_eq!(reply.response.status, 200);
+        let raw = reply.response.to_bytes(false);
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(!text.contains("<!doctype html>"));
     }
 }
