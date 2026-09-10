@@ -446,12 +446,14 @@ impl CgiProcess {
         }
     }
 
-    /// Kill and reap, for a script that overran its deadline.
+    /// Kill for a script that overran its deadline. Non-blocking: only
+    /// signals the child; reaping happens via `reap()` (`waitpid(WNOHANG)`)
+    /// on the next loop tick so the single thread never stalls in `wait()`.
     pub fn kill(&mut self) {
         self.finished = true;
         let _ = self.child.kill();
-        // Reap immediately so the killed child does not linger as a zombie.
-        let _ = self.child.wait();
+        // Best-effort non-blocking reap; the tick's `reap()` collects the rest.
+        let _ = self.child.try_wait();
     }
 
     pub fn stderr_text(&self) -> String {
@@ -466,10 +468,11 @@ impl CgiProcess {
 
 impl Drop for CgiProcess {
     /// A connection dropped mid-script must not leave the process running.
+    /// Non-blocking: never `wait()` here, the loop tick reaps via `try_wait`.
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = self.child.try_wait();
         }
     }
 }

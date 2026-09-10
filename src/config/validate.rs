@@ -29,6 +29,8 @@
 //! hosting: one listening socket, requests dispatched by `Host` header. Only an
 //! ambiguous claim on the same name is an error.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -368,6 +370,7 @@ pub fn validate(config: Config) -> Result<Validated, Vec<Issue>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::config::{Redirect, RouteConfig};
     use std::collections::BTreeMap;

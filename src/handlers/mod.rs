@@ -241,6 +241,14 @@ fn generated_name(request: &Request) -> String {
 }
 
 fn write_file(path: &Path, data: &[u8]) -> Result<(), u16> {
+    // Do not follow a symlink at the destination: an attacker (or a stale
+    // operator symlink like `uploads/link -> /tmp/outside`) must not redirect
+    // an upload outside the configured directory.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(403);
+        }
+    }
     fs::write(path, data).map_err(|e| status_for(&e))
 }
 
@@ -686,5 +694,19 @@ mod tests {
         assert_eq!(encode_segment("a b.txt"), "a%20b.txt");
         assert_eq!(encode_segment("plain-name_1.txt"), "plain-name_1.txt");
         assert_eq!(encode_segment("#frag?q"), "%23frag%3Fq");
+    }
+
+    #[test]
+    fn refuses_to_write_through_a_symlink() {
+        let dir = TempDir::new("symlink");
+        let outside = dir.path.join("outside.txt");
+        fs::write(&outside, b"original").unwrap();
+        let link = dir.path.join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(unix)]
+        assert_eq!(write_file(&link, b"overwrite"), Err(403));
+        #[cfg(unix)]
+        assert_eq!(fs::read(&outside).unwrap(), b"original");
     }
 }

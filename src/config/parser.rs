@@ -19,6 +19,8 @@
 //! `key: value`") apart from schema errors ("unknown key `serevr_names`"), and
 //! both keep their line numbers.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -644,6 +646,7 @@ pub fn parse_config(text: &str, base: &Path) -> Result<Config, ParseError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     fn parse(text: &str) -> Result<Config, ParseError> {

@@ -145,9 +145,11 @@ pub fn sanitize_filename(raw: &str) -> Option<String> {
     if base.is_empty() || base == "." || base == ".." {
         return None;
     }
-    // A leading dot would create a hidden file, and `..` anywhere is a
-    // traversal attempt however it is spelled.
-    if base.starts_with('.') || base.contains("..") {
+    // A leading dot would create a hidden file. `base` is already a single
+    // path component (split on '/' and '\' above), so `..` inside it like
+    // `a..b` is harmless — only "." and ".." themselves (checked above) are
+    // traversal attempts.
+    if base.starts_with('.') {
         return None;
     }
     // Control characters and NUL must never reach a filesystem call.
@@ -312,9 +314,11 @@ mod tests {
         assert_eq!(sanitize_filename("."), None);
         assert_eq!(sanitize_filename(""), None);
         assert_eq!(sanitize_filename("   "), None);
-        // Hidden files and embedded traversal are refused outright.
+        // Hidden files are refused outright; `..` inside a single component
+        // like `a..b` is harmless (no separator) and allowed.
         assert_eq!(sanitize_filename(".bashrc"), None);
-        assert_eq!(sanitize_filename("a..b"), None);
+        assert_eq!(sanitize_filename("a..b").as_deref(), Some("a..b"));
+        assert_eq!(sanitize_filename("archive..bak").as_deref(), Some("archive..bak"));
         // Control characters must never reach a filesystem call.
         assert_eq!(sanitize_filename("bad\0name"), None);
         assert_eq!(sanitize_filename("bad\nname"), None);

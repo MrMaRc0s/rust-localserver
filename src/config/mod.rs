@@ -16,6 +16,8 @@
 //! directory**, not the process working directory, so the server can be started
 //! from anywhere with `localserver /etc/localserver/config.yaml`.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod parser;
 pub mod validate;
 

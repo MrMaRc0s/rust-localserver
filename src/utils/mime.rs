@@ -11,6 +11,7 @@
 //! Written and unit-tested in Phase 3.4; the static-file handler that calls it
 //! lands in TASKS.md 5.1.
 #![allow(dead_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 /// Fallback for an unknown extension.
 ///
@@ -74,6 +75,7 @@ pub fn for_extension(extension: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::path::Path;
 

@@ -168,6 +168,18 @@ impl Response {
                 "Connection: close\r\n"
             });
         }
+        if !self.has_header("access-control-allow-origin") {
+            head.push_str("Access-Control-Allow-Origin: *\r\n");
+        }
+        if !self.has_header("access-control-allow-methods") {
+            head.push_str("Access-Control-Allow-Methods: GET, POST, DELETE, HEAD, OPTIONS\r\n");
+        }
+        if !self.has_header("access-control-allow-headers") {
+            head.push_str("Access-Control-Allow-Headers: *\r\n");
+        }
+        if !self.has_header("access-control-expose-headers") {
+            head.push_str("Access-Control-Expose-Headers: *\r\n");
+        }
         for (name, value) in &self.headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }

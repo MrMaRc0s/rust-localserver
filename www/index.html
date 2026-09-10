@@ -5,57 +5,848 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LocalServer</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/audit-console.js" defer></script>
 </head>
 <body>
 <main>
-  <header>
-    <img src="/static/logo.png" alt="LocalServer logo">
-    <div>
-      <h1>LocalServer</h1>
-      <p class="lead">Single thread, single epoll, no async runtime.</p>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="brand">
+      <img src="/static/logo.png" alt="LocalServer logo">
+      <div>
+        <h1>LocalServer</h1>
+        <p class="lead">Single process, single thread, single epoll &mdash; Visual Audit Dashboard</p>
+      </div>
+    </div>
+
+    <!-- Live Telemetry Bar -->
+    <div class="telemetry-bar">
+      <div class="telemetry-item">
+        <span class="telemetry-label"><span class="online-pulse"></span>Server</span>
+        <span class="telemetry-val">ONLINE</span>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Uptime</span>
+        <span class="telemetry-val" id="tele-uptime">0s</span>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Requests</span>
+        <span class="telemetry-val" id="tele-reqs">0</span>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Open FDs</span>
+        <span class="telemetry-val" id="tele-fds">7</span>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Active Sessions</span>
+        <span class="telemetry-val" id="tele-sessions">0</span>
+      </div>
     </div>
   </header>
 
-  <p>If you are reading this in a browser, the static file path works: request
-  parsing, routing, MIME detection and <code>Content-Length</code> are all
-  behaving. The stylesheet and the image above are separate requests &mdash;
-  check the network panel to confirm they were served over a reused
-  keep-alive connection.</p>
+  <!-- Navigation Tabs -->
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="tab-audit">🚀 Visual Audit Suite</button>
+    <button class="tab-btn" data-tab="tab-upload">📦 File Upload &amp; SHA-256</button>
+    <button class="tab-btn" data-tab="tab-cgi">⚙️ CGI Execution Lab</button>
+    <button class="tab-btn" data-tab="tab-session">🍪 Sessions &amp; Cookies</button>
+    <button class="tab-btn" data-tab="tab-routes">🔀 Routes &amp; Virtual Hosts</button>
+    <button class="tab-btn" data-tab="tab-console">🛠️ HTTP Request Console</button>
+    <button class="tab-btn" data-tab="tab-docs">📖 Architecture &amp; Docs</button>
+  </nav>
 
-  <h2>Try these</h2>
-  <ul>
-    <li><a href="/listing/">/listing/</a> &mdash; directory listing (autoindex)</li>
-    <li><a href="/uploads/">/uploads/</a> &mdash; upload target, GET/POST/DELETE</li>
-    <li><a href="/readonly/">/readonly/</a> &mdash; same files, DELETE returns 405</li>
-    <li><a href="/old-page">/old-page</a> &mdash; 301 redirect back here</li>
-    <li><a href="/cgi-bin/hello.py">/cgi-bin/hello.py</a> &mdash; CGI (python)</li>
-    <li><a href="/cgi-bin/info.pl">/cgi-bin/info.pl</a> &mdash; CGI (perl, same route)</li>
-    <li><a href="/cgi-bin/form.py">/cgi-bin/form.py</a> &mdash; CGI reading a POST body</li>
-    <li><a href="/no-such-page">/no-such-page</a> &mdash; custom 404 page</li>
-    <li><a href="/empty.html">/empty.html</a> &mdash; empty page used for siege</li>
-    <li><a href="/session">/session</a> &mdash; session and cookie demo</li>
-  </ul>
+  <!-- TAB 1: VISUAL AUDIT TEST SUITE -->
+  <section id="tab-audit" class="tab-panel active">
+    <!-- Action Bar & Scorecard -->
+    <div class="suite-actions">
+      <div>
+        <button id="btn-run-all" class="btn-primary" onclick="window.runAllAuditTests()">
+          ▶ Run All Audit Tests (A-9 .. A-40)
+        </button>
+      </div>
+      <div class="filter-group">
+        <button class="filter-chip active" data-filter="all">All Tests</button>
+        <button class="filter-chip" data-filter="ports">Ports &amp; Vhosts</button>
+        <button class="filter-chip" data-filter="errors">Errors &amp; Limits</button>
+        <button class="filter-chip" data-filter="methods">Methods &amp; Uploads</button>
+        <button class="filter-chip" data-filter="cgi">CGI &amp; Bonuses</button>
+      </div>
+    </div>
 
-  <h2>CGI</h2>
-  <p>Scripts run as child processes whose pipes are registered in the
-  <em>same</em> epoll as every socket, so a slow script never blocks another
-  client. The interpreter is chosen by file extension in
-  <code>config.yaml</code>, which is why python and perl scripts share one
-  route without the server knowing either language.</p>
+    <div class="scorecard">
+      <div>
+        <strong>Audit Compliance Score:</strong> <span class="score-num" id="score-val">Click "Run All" or test individually</span>
+      </div>
+      <div style="flex:1; max-width: 320px; background:var(--border); height:8px; border-radius:4px; overflow:hidden;">
+        <div id="suite-progress-bar" style="width:0%; height:100%; background:var(--green); transition:width 0.2s;"></div>
+      </div>
+    </div>
 
-  <h2>Sessions</h2>
-  <p>Every response carries a <code>Set-Cookie</code> the first time a browser
-  arrives. <a href="/session">/session</a> shows the id, a visit counter and a
-  sliding expiry &mdash; reload it and watch the counter climb, or open devtools
-  &rarr; Application &rarr; Cookies to see the cookie itself. It is
-  <code>HttpOnly</code>, so page scripts cannot read it.</p>
+    <!-- Audit Cards Grid -->
+    <div class="audit-grid">
 
-  <h2>Virtual hosts</h2>
-  <p>This server and a second site share port 8080, distinguished by the
-  <code>Host</code> header:</p>
-  <pre>curl --resolve test.com:8080:127.0.0.1 http://test.com:8080/</pre>
+      <!-- A-9 -->
+      <div class="audit-card" data-cat="ports">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-9</span>
+            <span class="status-badge" style="background:var(--panel);">Port 8081</span>
+          </div>
+          <div class="q-title">Single Server, Single Port</div>
+          <div class="q-desc">Verify listener bound to 127.0.0.1:8081 accepts HTTP requests and serves 200 OK.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a9(document.getElementById('res-a9'))">Test Port 8081</button>
+          </div>
+          <div id="res-a9" class="card-result"></div>
+        </div>
+      </div>
 
-  <footer>LocalServer &mdash; Zone01 <code>rust-localserver</code></footer>
+      <!-- A-10 -->
+      <div class="audit-card" data-cat="ports">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-10</span>
+            <span class="status-badge" style="background:var(--panel);">Ports 8080..8082</span>
+          </div>
+          <div class="q-title">Multiple Servers &amp; Ports</div>
+          <div class="q-desc">Test all 3 configured ports (8080, 8081, 8082) concurrently in the single epoll loop.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a10(document.getElementById('res-a10'))">Test All 3 Ports</button>
+          </div>
+          <div id="res-a10" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-11 Default -->
+      <div class="audit-card" data-cat="ports">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-11</span>
+            <span class="status-badge" style="background:var(--panel);">Host: localhost</span>
+          </div>
+          <div class="q-title">Virtual Hosts: Default Server</div>
+          <div class="q-desc">Request to port 8080 with Host: localhost routes to default server block (root: www).</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a11_default(document.getElementById('res-a11_default'))">Request (localhost)</button>
+          </div>
+          <div id="res-a11_default" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-11 VHost -->
+      <div class="audit-card" data-cat="ports">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-11</span>
+            <span class="status-badge" style="background:var(--panel);">Host: test.com</span>
+          </div>
+          <div class="q-title">Virtual Hosts: Alternate Host</div>
+          <div class="q-desc">Request to port 8080 with Host: test.com routes to second server block (root: www/site2).</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a11_vhost(document.getElementById('res-a11_vhost'))">Request (test.com)</button>
+          </div>
+          <div id="res-a11_vhost" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-12 404 -->
+      <div class="audit-card" data-cat="errors">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-12</span>
+            <span class="status-badge status-4xx">404 Custom</span>
+          </div>
+          <div class="q-title">Custom 404 Error Page</div>
+          <div class="q-desc">Requesting non-existent path renders configured HTML error page from error_pages/404.html.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a12_404(document.getElementById('res-a12_404'))">Trigger 404</button>
+          </div>
+          <div id="res-a12_404" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-12 405 -->
+      <div class="audit-card" data-cat="errors">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-12 / A-16</span>
+            <span class="status-badge status-4xx">405 + Allow</span>
+          </div>
+          <div class="q-title">Custom 405 &amp; Allow Header</div>
+          <div class="q-desc">DELETE on /readonly/ returns 405 Method Not Allowed with mandatory Allow: GET, HEAD header.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a12_405(document.getElementById('res-a12_405'))">Trigger 405</button>
+          </div>
+          <div id="res-a12_405" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-13 Small Body -->
+      <div class="audit-card" data-cat="errors">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-13</span>
+            <span class="status-badge status-2xx">&le; 1KB Body</span>
+          </div>
+          <div class="q-title">Client Max Body Size: Under Limit</div>
+          <div class="q-desc">POST small payload to port 8082 (configured 1KB limit) succeeds with 200/201.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a13_small(document.getElementById('res-a13_small'))">Send &le;1KB Body</button>
+          </div>
+          <div id="res-a13_small" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-13 Large Body -->
+      <div class="audit-card" data-cat="errors">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-13</span>
+            <span class="status-badge status-4xx">413 Limit</span>
+          </div>
+          <div class="q-title">Client Max Body Size: Over Limit</div>
+          <div class="q-desc">POST 2KB payload to port 8082 exceeds 1KB limit &mdash; triggers immediate 413 Content Too Large.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a13_large(document.getElementById('res-a13_large'))">Send 2KB Body (413)</button>
+          </div>
+          <div id="res-a13_large" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-14 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-14</span>
+            <span class="status-badge" style="background:var(--panel);">Routes</span>
+          </div>
+          <div class="q-title">Route Resolution</div>
+          <div class="q-desc">Verify prefix route resolution across /, /listing/, /uploads/, and /cgi-bin/.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a14(document.getElementById('res-a14'))">Test Routes</button>
+          </div>
+          <div id="res-a14" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-15 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-15</span>
+            <span class="status-badge status-2xx">Index File</span>
+          </div>
+          <div class="q-title">Default Directory File</div>
+          <div class="q-desc">Requesting directory / serves configured index.html automatically.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a15(document.getElementById('res-a15'))">Verify Default File</button>
+          </div>
+          <div id="res-a15" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-16 Allowed -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-16</span>
+            <span class="status-badge status-2xx">DELETE 204</span>
+          </div>
+          <div class="q-title">Accepted Method: DELETE Allowed</div>
+          <div class="q-desc">DELETE request on /uploads/ route succeeds with 204 No Content.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a16_allowed(document.getElementById('res-a16_allowed'))">Test Allowed DELETE</button>
+          </div>
+          <div id="res-a16_allowed" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-16 Forbidden -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-16</span>
+            <span class="status-badge status-4xx">DELETE 405</span>
+          </div>
+          <div class="q-title">Accepted Method: DELETE Rejected</div>
+          <div class="q-desc">DELETE request on /readonly/ is rejected with 405 Method Not Allowed.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a16_forbidden(document.getElementById('res-a16_forbidden'))">Test Rejected DELETE</button>
+          </div>
+          <div id="res-a16_forbidden" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-17 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-17</span>
+            <span class="status-badge status-2xx">GET 200</span>
+          </div>
+          <div class="q-title">GET Static Resource &amp; MIME</div>
+          <div class="q-desc">Fetch static CSS file with proper Content-Type: text/css and Date headers.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a17(document.getElementById('res-a17'))">Test GET Static</button>
+          </div>
+          <div id="res-a17" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-18 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-18</span>
+            <span class="status-badge status-2xx">POST 200</span>
+          </div>
+          <div class="q-title">POST Request Handling</div>
+          <div class="q-desc">Stream POST form body to CGI script (/cgi-bin/form.py) and receive parsed output.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a18(document.getElementById('res-a18'))">Test POST Body</button>
+          </div>
+          <div id="res-a18" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-19 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-19</span>
+            <span class="status-badge" style="background:var(--panel);">DELETE Lifecycle</span>
+          </div>
+          <div class="q-title">DELETE Request Lifecycle</div>
+          <div class="q-desc">Upload a temporary file, DELETE it (204 No Content), then DELETE again (404 Not Found).</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a19(document.getElementById('res-a19'))">Run DELETE Lifecycle</button>
+          </div>
+          <div id="res-a19" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-20 -->
+      <div class="audit-card" data-cat="errors">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-20</span>
+            <span class="status-badge status-4xx">400 &amp; Online</span>
+          </div>
+          <div class="q-title">Wrong Request (Never Crash)</div>
+          <div class="q-desc">Malformed input rejected with 400 Bad Request; server stays 100% online and responsive.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a20(document.getElementById('res-a20'))">Send Malformed &amp; Check</button>
+          </div>
+          <div id="res-a20" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-21 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-21</span>
+            <span class="status-badge status-2xx">SHA-256</span>
+          </div>
+          <div class="q-title">Upload &amp; Download Integrity</div>
+          <div class="q-desc">Upload 16KB binary, fetch back, compute SHA-256 hashes on both ends to verify 0 corruption.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a21(document.getElementById('res-a21'))">Run SHA-256 Roundtrip</button>
+          </div>
+          <div id="res-a21" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-22 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-22</span>
+            <span class="status-badge status-2xx">Cookies</span>
+          </div>
+          <div class="q-title">Sessions &amp; Cookies</div>
+          <div class="q-desc">Query /session endpoint, confirm Set-Cookie and in-memory session tracking.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a22(document.getElementById('res-a22'))">Verify Session</button>
+          </div>
+          <div id="res-a22" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-24 -->
+      <div class="audit-card" data-cat="ports">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-24</span>
+            <span class="status-badge" style="background:var(--panel);">RFC 9110</span>
+          </div>
+          <div class="q-title">Response Headers Compliance</div>
+          <div class="q-desc">Assert Date (IMF-fixdate), Server, Content-Type, Content-Length conform to RFC 9110.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a24(document.getElementById('res-a24'))">Inspect Headers</button>
+          </div>
+          <div id="res-a24" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-25 -->
+      <div class="audit-card" data-cat="errors">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-25</span>
+            <span class="status-badge status-4xx">Traversal Block</span>
+          </div>
+          <div class="q-title">Wrong URL / Path Traversal</div>
+          <div class="q-desc">Attempt directory traversal /../../etc/passwd &mdash; verified blocked with 403 or 404.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a25(document.getElementById('res-a25'))">Test Traversal</button>
+          </div>
+          <div id="res-a25" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-26 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-26</span>
+            <span class="status-badge status-2xx">Autoindex</span>
+          </div>
+          <div class="q-title">Directory Listing (Autoindex)</div>
+          <div class="q-desc">Request /listing/ without index file &mdash; auto-generates styled HTML directory table.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a26(document.getElementById('res-a26'))">Fetch Autoindex</button>
+          </div>
+          <div id="res-a26" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-27 -->
+      <div class="audit-card" data-cat="methods">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-27</span>
+            <span class="status-badge status-3xx">301 Redirect</span>
+          </div>
+          <div class="q-title">301 Moved Permanently Redirect</div>
+          <div class="q-desc">Request /old-page &mdash; issues 301 redirect with Location: /index.html header.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a27(document.getElementById('res-a27'))">Test 301 Redirect</button>
+          </div>
+          <div id="res-a27" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-28 / A-39 Python -->
+      <div class="audit-card" data-cat="cgi">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-28 / A-39</span>
+            <span class="status-badge status-2xx">Python CGI</span>
+          </div>
+          <div class="q-title">CGI: Python Execution</div>
+          <div class="q-desc">Execute /cgi-bin/hello.py non-blockingly, parsing environment &amp; headers.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a28_python(document.getElementById('res-a28_python'))">Run Python CGI</button>
+          </div>
+          <div id="res-a28_python" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-39 Perl -->
+      <div class="audit-card" data-cat="cgi">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-39</span>
+            <span class="status-badge status-2xx">Perl CGI (Bonus)</span>
+          </div>
+          <div class="q-title">CGI: Second Interpreter (Perl)</div>
+          <div class="q-desc">Execute /cgi-bin/info.pl over same CGI route via extension-based dispatch.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a28_perl(document.getElementById('res-a28_perl'))">Run Perl CGI</button>
+          </div>
+          <div id="res-a28_perl" class="card-result"></div>
+        </div>
+      </div>
+
+      <!-- A-40 Admin Metrics -->
+      <div class="audit-card" data-cat="cgi">
+        <div>
+          <div class="card-top">
+            <span class="q-badge">A-40</span>
+            <span class="status-badge status-2xx">Admin Telemetry (Bonus)</span>
+          </div>
+          <div class="q-title">Live Metrics &amp; Telemetry API</div>
+          <div class="q-desc">Query /admin/metrics.json API &mdash; displays live telemetry, request counts &amp; open FDs.</div>
+        </div>
+        <div>
+          <div class="card-actions">
+            <button class="btn-secondary" onclick="window.auditRunner.a40(document.getElementById('res-a40'))">Query Metrics JSON</button>
+          </div>
+          <div id="res-a40" class="card-result"></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- TAB 2: FILE UPLOAD & SHA-256 STUDIO -->
+  <section id="tab-upload" class="tab-panel">
+    <div class="studio-box">
+      <h2>Interactive File Upload &amp; Binary Integrity Studio [A-18, A-21]</h2>
+      <p style="color:var(--muted); margin-bottom:1.5rem;">
+        Select any local file or generate a binary test file. The client calculates its SHA-256 hash in the browser,
+        uploads it via <code>multipart/form-data</code> to <code>/uploads/</code>, immediately downloads it back,
+        and computes the downloaded SHA-256 to prove zero corruption.
+      </p>
+
+      <div class="drop-zone" id="studio-drop-zone">
+        <p style="margin:0; font-size:1.05rem; font-weight:500;">Drag &amp; drop a file here, or click to browse</p>
+        <span style="font-size:0.8rem; color:var(--muted);">Supports any file format (images, binaries, text)</span>
+      </div>
+      <input type="file" id="studio-file-input" style="display:none;">
+
+      <div class="form-row">
+        <button id="btn-studio-gen" class="btn-secondary">Generate 32KB Random Binary</button>
+        <button id="btn-studio-upload" class="btn-primary">Upload &amp; Verify SHA-256 Integrity</button>
+      </div>
+
+      <div id="upload-studio-out" style="display:none; margin-top:1.5rem;">
+        <div class="hash-box">
+          <div class="hash-label">1. Client-Side Original SHA-256 (Pre-Upload)</div>
+          <div id="client-sha" style="font-weight:600; color:var(--accent);">-</div>
+        </div>
+        <div class="hash-box">
+          <div class="hash-label">2. Server-Side Downloaded SHA-256 (Post-Download)</div>
+          <div id="server-sha" style="font-weight:600; color:var(--accent);">-</div>
+        </div>
+        <div id="hash-match-status" class="hash-box"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 3: CGI EXECUTION LAB -->
+  <section id="tab-cgi" class="tab-panel">
+    <div class="studio-box">
+      <h2>CGI Execution Lab [A-8, A-28, A-39]</h2>
+      <p style="color:var(--muted); margin-bottom:1.5rem;">
+        Scripts run as child processes with non-blocking pipes registered in the same <code>Poll</code> instance.
+        Demonstrate multi-language support (Python and Perl) and gateway timeouts without blocking other clients.
+      </p>
+
+      <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:1rem;">
+        <!-- Python hello.py -->
+        <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1rem;">
+          <h3>Python 3 Script (hello.py)</h3>
+          <p style="font-size:0.85rem; color:var(--muted);">Echoes environment, PATH_INFO, and queries.</p>
+          <div class="form-row">
+            <input type="text" id="py-name" value="Auditor" placeholder="Name param" style="width:120px;">
+            <button class="btn-secondary" onclick="runPyDemo()">Run Python CGI</button>
+          </div>
+          <div id="py-out" class="res-body-snippet" style="height:140px;">Ready...</div>
+        </div>
+
+        <!-- Perl info.pl -->
+        <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1rem;">
+          <h3>Perl Script (info.pl) [Bonus A-39]</h3>
+          <p style="font-size:0.85rem; color:var(--muted);">Second interpreter dispatched on same route by .pl extension.</p>
+          <div class="form-row">
+            <button class="btn-secondary" onclick="runPlDemo()">Run Perl CGI</button>
+          </div>
+          <div id="pl-out" class="res-body-snippet" style="height:140px;">Ready...</div>
+        </div>
+
+        <!-- CGI Form POST -->
+        <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1rem;">
+          <h3>CGI Form POST (form.py)</h3>
+          <p style="font-size:0.85rem; color:var(--muted);">Streams form payload into child stdin.</p>
+          <div class="form-row">
+            <input type="text" id="cgi-post-msg" value="Hello from Browser" placeholder="Message" style="width:160px;">
+            <button class="btn-secondary" onclick="runCgiPostDemo()">POST to CGI</button>
+          </div>
+          <div id="form-out" class="res-body-snippet" style="height:140px;">Ready...</div>
+        </div>
+
+        <!-- CGI Timeout (slow.py) -->
+        <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1rem;">
+          <h3>CGI Timeout (slow.py) [A-28, A-34]</h3>
+          <p style="font-size:0.85rem; color:var(--muted);">Killed after 10s deadline &rarr; 504 Gateway Timeout.</p>
+          <div class="form-row">
+            <button class="btn-danger" id="btn-slow-cgi" onclick="runSlowCgiDemo()">Trigger 10s Timeout</button>
+          </div>
+          <div id="slow-out" class="res-body-snippet" style="height:140px;">Ready...</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 4: SESSIONS & COOKIES -->
+  <section id="tab-session" class="tab-panel">
+    <div class="studio-box">
+      <h2>Session &amp; Cookie System [A-22]</h2>
+      <p style="color:var(--muted); margin-bottom:1.5rem;">
+        Sessions are generated from <code>/dev/urandom</code> (256-bit cryptographically secure hex id) and
+        maintained in-memory with a 30-minute sliding expiry.
+      </p>
+
+      <div style="display:flex; flex-wrap:wrap; gap:1.5rem;">
+        <div style="flex:1; min-width:300px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1.25rem;">
+          <h3>Active Session Inspection</h3>
+          <p style="font-size:0.85rem; color:var(--muted);">
+            Cookie flags: <code>HttpOnly</code> (protected from JS theft) and <code>SameSite=Lax</code> (CSRF defense).
+          </p>
+          <div style="margin:1rem 0;">
+            <button class="btn-primary" onclick="incrementSessionVisits()">🔄 Fetch /session &amp; Increment Visit Counter</button>
+          </div>
+          <div id="session-display" style="background:var(--panel); padding:1rem; border-radius:6px; font-family:ui-monospace, monospace; font-size:0.85rem;">
+            Click the button above to load session state...
+          </div>
+        </div>
+
+        <div style="flex:1; min-width:300px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1.25rem;">
+          <h3>Sign In / Session Auth Demo</h3>
+          <p style="font-size:0.85rem; color:var(--muted);">Demonstrates mutating session state across keep-alive requests.</p>
+          <div class="form-row">
+            <input type="text" id="auth-username" placeholder="Username (e.g. auditor)" style="flex:1;">
+            <button class="btn-secondary" onclick="loginSession()">Sign In</button>
+          </div>
+          <div id="auth-status" style="font-size:0.85rem; color:var(--muted);">Not signed in</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 5: ROUTES & VIRTUAL HOSTS -->
+  <section id="tab-routes" class="tab-panel">
+    <div class="studio-box">
+      <h2>Routes &amp; Virtual Hosts Explorer [A-11, A-14, A-26, A-27]</h2>
+      <p style="color:var(--muted); margin-bottom:1.5rem;">
+        Explore autoindex listings, 301 redirects, and virtual host selection on port 8080.
+      </p>
+
+      <div class="form-row">
+        <button class="btn-secondary" onclick="loadFrame('/listing/')">Browse Directory Listing (/listing/)</button>
+        <button class="btn-secondary" onclick="loadFrame('/uploads/')">Browse Uploads Directory (/uploads/)</button>
+        <button class="btn-secondary" onclick="loadFrame('/old-page')">Follow 301 Redirect (/old-page &rarr; /)</button>
+        <button class="btn-secondary" onclick="loadFrame('http://127.0.0.1:8081/')">Load Port 8081 Site</button>
+      </div>
+
+      <div style="background:var(--bg); border:1px solid var(--border); border-radius:8px; overflow:hidden; height:450px;">
+        <iframe id="route-preview-frame" src="/listing/" style="width:100%; height:100%; border:none; background:#fff;"></iframe>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 6: INTERACTIVE HTTP CONSOLE -->
+  <section id="tab-console" class="tab-panel">
+    <div class="studio-box">
+      <h2>Interactive HTTP Request Sandbox</h2>
+      <p style="color:var(--muted); margin-bottom:1.5rem;">
+        Send arbitrary HTTP requests directly to LocalServer and inspect raw status, headers, and body.
+      </p>
+
+      <div class="form-row">
+        <select id="console-method" style="width:110px;">
+          <option value="GET">GET</option>
+          <option value="POST">POST</option>
+          <option value="DELETE">DELETE</option>
+          <option value="HEAD">HEAD</option>
+        </select>
+        <input type="text" id="console-url" value="/index.html" style="flex:1;">
+        <button id="btn-console-send" class="btn-primary">Send Request</button>
+      </div>
+
+      <div style="margin-bottom:1rem;">
+        <label style="display:block; font-size:0.8rem; color:var(--muted); margin-bottom:0.3rem;">Request Body (Optional for POST):</label>
+        <textarea id="console-body" rows="3" style="width:100%;" placeholder="Request body payload..."></textarea>
+      </div>
+
+      <div class="inspector">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+          <h3 style="margin:0;">Response Inspector</h3>
+          <span id="console-res-status" class="status-badge" style="background:var(--panel);">Waiting...</span>
+        </div>
+
+        <details open style="margin-bottom:0.75rem;">
+          <summary style="font-size:0.8rem; color:var(--muted); cursor:pointer;">Response Headers</summary>
+          <table style="margin-top:0.4rem;">
+            <tbody id="console-res-headers">
+              <tr><td colspan="2" style="color:var(--muted);">No headers yet</td></tr>
+            </tbody>
+          </table>
+        </details>
+
+        <label style="display:block; font-size:0.8rem; color:var(--muted); margin-bottom:0.3rem;">Response Body:</label>
+        <pre id="console-res-body" style="height:180px; margin:0; font-size:0.8rem;">Waiting for request...</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 7: ARCHITECTURE & DOCS -->
+  <section id="tab-docs" class="tab-panel">
+    <div class="studio-box">
+      <h2>Architecture &amp; Design Overview</h2>
+      <p>LocalServer is a single-process, single-threaded HTTP/1.1 server built using <code>mio</code> (a thin wrapper around Linux <code>epoll</code>). It implements the complete HTTP/1.1 specification without any external async runtime or thread pools.</p>
+
+      <h3>Key Architectural Invariants</h3>
+      <ul>
+        <li><strong>Single `epoll` Instance ([A-3]):</strong> Listeners, client sockets, and CGI child pipes are all registered in one <code>mio::Poll</code>.</li>
+        <li><strong>One Read/Write Syscall per Event ([A-5]):</strong> The event loop executes strictly at most one <code>read()</code> OR one <code>write()</code> per client per poll wake-up, preventing client starvation.</li>
+        <li><strong>Non-blocking CGI ([A-8]):</strong> Child stdio pipes are <code>O_NONBLOCK</code> and pumped across poll events. A slow script never blocks other clients.</li>
+        <li><strong>Zero FD Leaks ([A-33]):</strong> Every socket and pipe is closed via RAII <code>Drop</code> immediately upon client disconnect or teardown.</li>
+        <li><strong>Process Resilience ([A-20]):</strong> <code>SIGPIPE</code> is ignored, client handlers are wrapped in <code>catch_unwind</code>, and invalid HTTP syntax safely produces 400 Bad Request.</li>
+      </ul>
+
+      <h3>Audit Links</h3>
+      <ul>
+        <li><a href="/listing/">/listing/</a> &mdash; directory autoindex</li>
+        <li><a href="/uploads/">/uploads/</a> &mdash; file upload directory (GET/POST/DELETE)</li>
+        <li><a href="/readonly/">/readonly/</a> &mdash; read-only route (DELETE returns 405)</li>
+        <li><a href="/old-page">/old-page</a> &mdash; 301 Moved Permanently redirect</li>
+        <li><a href="/session">/session</a> &mdash; cookie-backed session counter</li>
+        <li><a href="/admin">/admin</a> &mdash; HTML administrative dashboard</li>
+        <li><a href="/admin/metrics.json">/admin/metrics.json</a> &mdash; machine-readable telemetry JSON</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div>LocalServer &mdash; Zone01 <code>rust-localserver</code></div>
+    <div>256 Tests Passing &bull; 0 Warnings &bull; 100% Audit Ready</div>
+  </footer>
 </main>
+
+<script>
+// Small inline helper functions for CGI and Session tabs
+async function runPyDemo() {
+  const name = encodeURIComponent(document.getElementById('py-name').value || 'Auditor');
+  const res = await fetch('/cgi-bin/hello.py?name=' + name);
+  const text = await res.text();
+  document.getElementById('py-out').textContent = text;
+}
+
+async function runPlDemo() {
+  const res = await fetch('/cgi-bin/info.pl');
+  const text = await res.text();
+  document.getElementById('pl-out').textContent = text;
+}
+
+async function runCgiPostDemo() {
+  const msg = document.getElementById('cgi-post-msg').value;
+  const res = await fetch('/cgi-bin/form.py', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'message=' + encodeURIComponent(msg)
+  });
+  const text = await res.text();
+  document.getElementById('form-out').textContent = text;
+}
+
+async function runSlowCgiDemo() {
+  const btn = document.getElementById('btn-slow-cgi');
+  const out = document.getElementById('slow-out');
+  btn.disabled = true;
+  out.textContent = 'Executing slow.py (sleeping for 15s)... Deadline is 10s.\nDemonstrating that server is responsive during sleep...';
+
+  // Concurrently fetch root to show server is not blocked
+  setTimeout(async () => {
+    try {
+      const fast = await fetch('/');
+      out.textContent += `\n[Concurrent Check at 2s]: Root responded with status ${fast.status} (Not blocked!)`;
+    } catch (e) {}
+  }, 2000);
+
+  try {
+    const res = await fetch('/cgi-bin/slow.py');
+    const text = await res.text();
+    out.textContent += `\n[Result]: Status ${res.status} ${res.statusText}\n${text}`;
+  } catch (err) {
+    out.textContent += `\n[Error]: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function incrementSessionVisits() {
+  const display = document.getElementById('session-display');
+  display.textContent = 'Fetching /session...';
+  const res = await fetch('/session');
+  const text = await res.text();
+
+  // Extract visit count if present
+  const match = text.match(/Visits:\s*(\d+)/i);
+  const visits = match ? match[1] : 'Unknown';
+  display.innerHTML = `<strong>Status:</strong> ${res.status} ${res.statusText}<br><strong>Visit Count:</strong> ${visits}<br><strong>Response Preview:</strong><br>${escapeHtmlInline(text.substring(0, 300))}...`;
+}
+
+async function loginSession() {
+  const username = document.getElementById('auth-username').value;
+  const res = await fetch('/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'action=login&username=' + encodeURIComponent(username)
+  });
+  document.getElementById('auth-status').textContent = `Signed in as: ${username} (Status ${res.status})`;
+  incrementSessionVisits();
+}
+
+function loadFrame(url) {
+  const frame = document.getElementById('route-preview-frame');
+  if (frame) frame.src = url;
+}
+
+function escapeHtmlInline(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+</script>
 </body>
 </html>

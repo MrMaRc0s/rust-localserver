@@ -593,7 +593,24 @@ impl Server {
     }
 
     /// One readiness event on one CGI pipe: one read, or one write.
+    /// Wrapped in `catch_unwind` like [`Self::dispatch`]: a bug in CGI
+    /// handling must drop that one client (502), not the whole process.
     fn dispatch_cgi(&mut self, token: Token, event: &Event) {
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.dispatch_cgi_inner(token, event)
+        }));
+        if outcome.is_err() {
+            eprintln!("localserver: panic while handling CGI pipe {token:?}, dropping the client");
+            // Find the owning connection to close it cleanly.
+            if let Some(connection) = self.cgi_pipes.get(&token).copied() {
+                self.kill_cgi(connection);
+                self.finish_cgi_with_status(connection, 502);
+                self.close(connection);
+            }
+        }
+    }
+
+    fn dispatch_cgi_inner(&mut self, token: Token, event: &Event) {
         let connection = match self.cgi_pipes.get(&token) {
             Some(connection) => *connection,
             // A pipe event for a script that has already been torn down.

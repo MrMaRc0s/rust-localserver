@@ -3,6 +3,8 @@
 //!
 //! Filled in by TASKS.md 3.x.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod chunked;
 pub mod multipart;
 pub mod request;

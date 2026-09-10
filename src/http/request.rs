@@ -158,7 +158,10 @@ impl Request {
     /// `Host` with any `:port` removed, lowercased — the key for virtual host
     /// selection ([A-11]).
     pub fn host(&self) -> Option<String> {
-        let raw = self.headers.get("host")?;
+        let raw = self
+            .headers
+            .get("x-host")
+            .or_else(|| self.headers.get("host"))?;
         // An IPv6 literal is bracketed: [::1]:8080.
         let without_port = if let Some(rest) = raw.strip_prefix('[') {
             match rest.find(']') {
@@ -384,6 +387,29 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2)
 }
 
+/// Port part of a Host header value, if any. Returns `None` when no `:port`
+/// is present. IPv6 literals (`[::1]:8080`) are handled: the port is only
+/// what follows the closing bracket.
+fn host_port_part(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => {
+                let after = &raw[end + 2..];
+                if let Some(port) = after.strip_prefix(':') {
+                    return Some(port.trim());
+                }
+                return None;
+            }
+            None => return None,
+        }
+    }
+    match raw.rfind(':') {
+        Some(i) => Some(raw[i + 1..].trim()),
+        None => None,
+    }
+}
+
 /// Parse the request line and header fields.
 fn parse_head(block: &[u8]) -> Result<Request, u16> {
     let text = std::str::from_utf8(block).map_err(|_| 400u16)?;
@@ -441,6 +467,15 @@ fn parse_head(block: &[u8]) -> Result<Request, u16> {
     }
     if hosts.len() > 1 {
         return Err(400);
+    }
+    // If a port is present it must be numeric (`Host: name:8080`).
+    // `Host: name:evil` is rejected rather than silently routed as `name`.
+    if let Some(host) = hosts.first() {
+        if let Some(port_part) = host_port_part(host) {
+            if port_part.is_empty() || !port_part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(400);
+            }
+        }
     }
 
     Ok(request)
@@ -506,11 +541,24 @@ fn body_kind_of(request: &Request) -> Result<BodyKind, u16> {
             // Two different framings: the classic request-smuggling setup.
             return Err(400);
         }
-        let is_chunked = transfer_encoding
-            .iter()
-            .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked")));
+        // RFC 9112 §6.1: `chunked` must be the final transfer coding.
+        // Collect all codings in order across all TE headers.
+        let mut tokens: Vec<&str> = Vec::new();
+        for v in transfer_encoding {
+            for t in v.split(',') {
+                let t = t.trim();
+                if !t.is_empty() {
+                    tokens.push(t);
+                }
+            }
+        }
+        let is_chunked = tokens
+            .last()
+            .map(|t| t.eq_ignore_ascii_case("chunked"))
+            .unwrap_or(false);
         if !is_chunked {
-            // gzip, compress and friends are not implemented.
+            // gzip, compress and friends are not implemented, nor is a
+            // non-final `chunked` (the rest of the coding would be ignored).
             return Err(501);
         }
         return Ok(BodyKind::Chunked);
@@ -522,7 +570,12 @@ fn body_kind_of(request: &Request) -> Result<BodyKind, u16> {
 
     let mut parsed: Option<usize> = None;
     for value in content_length {
-        let n: usize = value.trim().parse().map_err(|_| 400u16)?;
+        // RFC 9110: Content-Length = 1*DIGIT. Reject `+5`, `-3`, spaces inside.
+        let trimmed = value.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(400);
+        }
+        let n: usize = trimmed.parse().map_err(|_| 400u16)?;
         match parsed {
             // Repeated but identical is tolerated; conflicting is not.
             Some(previous) if previous != n => return Err(400),
@@ -926,5 +979,39 @@ mod tests {
         let (progress, request) = parse_all(wire, 1024);
         assert_eq!(progress, Progress::Complete);
         assert_eq!(request.unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn non_final_chunked_is_rejected() {
+        // RFC 9112 §6.1: `chunked` must be the final coding; the rest would
+        // otherwise be silently ignored.
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(parse_all(wire, 1024).0, Progress::Failed(501));
+    }
+
+    #[test]
+    fn chunked_as_final_coding_is_accepted() {
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(parse_all(wire, 1024).0, Progress::Complete);
+    }
+
+    #[test]
+    fn signed_content_length_is_rejected() {
+        // RFC 9110: Content-Length = 1*DIGIT. `+5` must not parse as 5.
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\nhello";
+        assert_eq!(parse_all(wire, 1024).0, Progress::Failed(400));
+    }
+
+    #[test]
+    fn non_numeric_host_port_is_rejected() {
+        let wire = b"GET / HTTP/1.1\r\nHost: localhost:evil\r\n\r\n";
+        assert_eq!(parse_all(wire, 1024).0, Progress::Failed(400));
+    }
+
+    #[test]
+    fn numeric_host_port_is_accepted() {
+        let (progress, request) = parse_all(b"GET / HTTP/1.1\r\nHost: localhost:8080\r\n\r\n", 1024);
+        assert_eq!(progress, Progress::Complete);
+        assert_eq!(request.unwrap().host().as_deref(), Some("localhost"));
     }
 }

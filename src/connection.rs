@@ -800,6 +800,22 @@ fn session_demo(
     request: &Request,
     state: &Option<SessionState>,
 ) -> Reply {
+    let head_only = request.method_enum() == Some(Method::Head);
+    let reply = session_demo_inner(sessions, request, state);
+    if head_only {
+        let mut reply = reply;
+        reply.response = reply.response.head_only(true);
+        reply
+    } else {
+        reply
+    }
+}
+
+fn session_demo_inner(
+    sessions: &Rc<RefCell<SessionStore>>,
+    request: &Request,
+    state: &Option<SessionState>,
+) -> Reply {
     let state = match state {
         Some(state) => state,
         // No session could be issued at all.
@@ -882,7 +898,9 @@ fn route_request(
         // RFC 9110 requires Allow on a 405 so the client learns what it may use.
         Resolution::MethodNotAllowed { allow } => {
             return Routed::Reply(Reply::immediate(
-                error::page(server, 405).header("Allow", &allow),
+                error::page(server, 405)
+                    .header("Allow", &allow)
+                    .head_only(head_only),
             ))
         }
 

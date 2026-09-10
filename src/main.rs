@@ -9,6 +9,8 @@
 //! never blocks. See `docs/TASKS.md` for the phased implementation plan and
 //! `docs/AUDIT_NOTES.md` for the line-referenced walkthrough.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 mod cgi;
 mod config;
 mod connection;
