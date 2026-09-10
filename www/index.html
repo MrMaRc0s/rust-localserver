@@ -31,7 +31,15 @@
     <li><a href="/cgi-bin/hello.py">/cgi-bin/hello.py</a> &mdash; CGI</li>
     <li><a href="/no-such-page">/no-such-page</a> &mdash; custom 404 page</li>
     <li><a href="/empty.html">/empty.html</a> &mdash; empty page used for siege</li>
+    <li><a href="/session">/session</a> &mdash; session and cookie demo</li>
   </ul>
+
+  <h2>Sessions</h2>
+  <p>Every response carries a <code>Set-Cookie</code> the first time a browser
+  arrives. <a href="/session">/session</a> shows the id, a visit counter and a
+  sliding expiry &mdash; reload it and watch the counter climb, or open devtools
+  &rarr; Application &rarr; Cookies to see the cookie itself. It is
+  <code>HttpOnly</code>, so page scripts cannot read it.</p>
 
   <h2>Virtual hosts</h2>
   <p>This server and a second site share port 8080, distinguished by the

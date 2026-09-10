@@ -28,6 +28,13 @@
 //! so the next `poll()` returns this connection again. One read per event is
 //! preserved, and every client still gets its turn in between.
 //!
+//! Writing needs the same treatment for the opposite reason. A *partial* write
+//! means the socket buffer filled, and draining it produces a genuine writable
+//! edge. A *complete* write leaves the socket writable without any transition,
+//! so nothing further is reported — and a response sent in chunks (a streamed
+//! file, a pipelined reply) would stall half-delivered. So a complete write
+//! re-arms as well.
+//!
 //! # The error rule ([A-6], [A-7])
 //!
 //! Every I/O return value goes through [`classify_read`] / [`classify_write`],
@@ -62,12 +69,18 @@ use std::time::{Duration, Instant};
 use mio::net::TcpStream;
 use mio::{Interest, Token};
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::config::{Method, ServerConfig};
+use crate::error;
+use crate::handlers::session_page::{self, Command};
+use crate::handlers::{self, FileBody, Reply, STREAM_CHUNK};
 use crate::http::request::{Progress, Request, RequestParser};
 use crate::http::response::Response;
 use crate::router::{self, Resolution};
+use crate::utils::cookie::{self, SetCookie};
+use crate::utils::session::{self, SessionStore};
 
 /// Bytes requested per `read()`. One syscall moves at most this much.
 const READ_CHUNK: usize = 16 * 1024;
@@ -182,9 +195,15 @@ pub struct Connection {
     /// Owns the bytes received but not yet consumed, so a request split across
     /// many reads survives between events.
     parser: RequestParser,
+    /// Staging buffer: the response head, then one chunk of the body at a
+    /// time when the body is streamed from a file.
     write_buf: Vec<u8>,
     /// How much of `write_buf` has been handed to the kernel so far.
     write_pos: usize,
+    /// A response body still on disk. Refilled into `write_buf` a chunk at a
+    /// time so a large download never occupies more than one chunk of memory
+    /// and never monopolises the loop.
+    body_source: Option<FileBody>,
     after_write: AfterWrite,
     keep_alive: bool,
     /// A `100 Continue` has already been sent for the request in progress.
@@ -192,6 +211,13 @@ pub struct Connection {
     /// Servers sharing the listener this connection arrived on; the router
     /// picks between them by `Host`.
     servers: Rc<Vec<ServerConfig>>,
+    /// The process-wide session store.
+    ///
+    /// `Rc<RefCell<_>>` and not `Arc<Mutex<_>>`: there is one thread, so
+    /// atomic refcounting and locking would cost something and protect against
+    /// nothing. `RefCell` still enforces the borrow rules at runtime, so an
+    /// accidental nested borrow is caught rather than corrupting the map.
+    sessions: Rc<RefCell<SessionStore>>,
     /// The virtual host's body limit has been applied to the parser.
     limit_narrowed: bool,
     /// The last read filled the buffer, so the socket may hold more. Because
@@ -214,6 +240,7 @@ impl Connection {
         token: Token,
         max_body: usize,
         servers: Rc<Vec<ServerConfig>>,
+        sessions: Rc<RefCell<SessionStore>>,
     ) -> Connection {
         let now = Instant::now();
         Connection {
@@ -225,10 +252,12 @@ impl Connection {
             parser: RequestParser::new(max_body),
             write_buf: Vec::new(),
             write_pos: 0,
+            body_source: None,
             after_write: AfterWrite::Close,
             keep_alive: true,
             sent_continue: false,
             servers,
+            sessions,
             limit_narrowed: false,
             rearm: false,
             created_at: now,
@@ -281,10 +310,19 @@ impl Connection {
         if pending.is_empty() {
             return IoOutcome::Progress(0);
         }
+        let pending_len = pending.len();
         let outcome = classify_write(self.socket.write(pending));
         if let IoOutcome::Progress(n) = outcome {
             self.write_pos += n;
             self.last_activity = Instant::now();
+            // A *partial* write means the socket buffer filled up, so a real
+            // writable edge will arrive when the peer drains it. A *complete*
+            // write leaves the socket writable with no transition at all, and
+            // an edge-triggered registration reports nothing further — so if
+            // more remains to send (the next chunk of a streamed file, or a
+            // pipelined response), the registration has to be re-armed or the
+            // response stalls half-sent.
+            self.rearm = n == pending_len;
         }
         outcome
     }
@@ -314,6 +352,20 @@ impl Connection {
                 if self.write_pos < self.write_buf.len() {
                     // Partially flushed; the next writable event continues.
                     return Action::Keep;
+                }
+                // The buffer is empty. If the body is still being streamed from
+                // disk, pull the next chunk instead of finishing.
+                match self.refill_from_file() {
+                    Ok(true) => return Action::Keep,
+                    Ok(false) => {}
+                    Err(e) => {
+                        // The file changed or became unreadable mid-response.
+                        // The headers, Content-Length included, are already on
+                        // the wire, so the only honest thing left is to close:
+                        // a truncated body must not look like a complete one.
+                        eprintln!("localserver: streaming to {} failed: {e}", self.peer);
+                        return Action::Close;
+                    }
                 }
                 match self.after_write {
                     AfterWrite::Close => Action::Close,
@@ -368,7 +420,7 @@ impl Connection {
                         // exceeded by what has arrived.
                         if let Progress::Failed(status) = self.parser.feed(&[]) {
                             self.keep_alive = false;
-                            let bytes = error_response(status).to_bytes(false);
+                            let bytes = self.error_bytes(status);
                             self.queue(bytes, AfterWrite::Close);
                             return Action::Keep;
                         }
@@ -398,10 +450,9 @@ impl Connection {
                 self.limit_narrowed = false;
                 self.keep_alive = request.wants_keep_alive();
                 self.requests += 1;
-                let response = respond(&self.servers, &request);
-                let bytes = response.to_bytes(self.keep_alive);
+                let reply = build_reply(&self.servers, &self.sessions, &request);
                 let next = if self.keep_alive { AfterWrite::NextRequest } else { AfterWrite::Close };
-                self.queue(bytes, next);
+                self.queue_reply(reply, next);
                 Action::Keep
             }
 
@@ -410,8 +461,7 @@ impl Connection {
                 // state: there is no way to find where the next request would
                 // begin, so the connection ends after the error response.
                 self.keep_alive = false;
-                let response = error_response(status);
-                let bytes = response.to_bytes(false);
+                let bytes = self.error_bytes(status);
                 self.queue(bytes, AfterWrite::Close);
                 Action::Keep
             }
@@ -422,14 +472,77 @@ impl Connection {
     fn queue(&mut self, bytes: Vec<u8>, after: AfterWrite) {
         self.write_buf = bytes;
         self.write_pos = 0;
+        self.body_source = None;
         self.after_write = after;
         self.state = State::Writing;
+    }
+
+    /// Queue a reply whose body may still be on disk.
+    fn queue_reply(&mut self, reply: Reply, after: AfterWrite) {
+        let Reply { response, body } = reply;
+        self.write_buf = response.to_bytes(self.keep_alive);
+        self.write_pos = 0;
+        self.body_source = body;
+        self.after_write = after;
+        self.state = State::Writing;
+    }
+
+    /// Serialize an error response.
+    ///
+    /// Used for failures that happen before a request exists — a malformed
+    /// request line, a timeout — so there is no `Host` to select a virtual host
+    /// with. The listener's default server supplies the configured pages, which
+    /// means a custom 400 page works even for a request too broken to name a
+    /// host.
+    fn error_bytes(&self, status: u16) -> Vec<u8> {
+        let response = match router::select_server(&self.servers, None) {
+            Some(server) => error::page(server, status),
+            None => error::builtin(status),
+        };
+        response.header("Connection", "close").to_bytes(false)
+    }
+
+    /// Pull the next chunk of a streamed body into the write buffer.
+    ///
+    /// Returns whether there was anything to send. One bounded read per
+    /// writable event: `epoll` cannot watch a regular file (it reports one as
+    /// always ready), so there is no readiness to wait for — but chunking keeps
+    /// a large download from holding the single thread, which is the same
+    /// reasoning as one socket read per event.
+    fn refill_from_file(&mut self) -> io::Result<bool> {
+        let source = match self.body_source.as_mut() {
+            Some(source) => source,
+            None => return Ok(false),
+        };
+        if source.remaining == 0 {
+            self.body_source = None;
+            return Ok(false);
+        }
+
+        let want = STREAM_CHUNK.min(source.remaining as usize);
+        let mut chunk = vec![0u8; want];
+        let read = source.file.read(&mut chunk)?;
+        if read == 0 {
+            // The file is shorter than its metadata said. Content-Length has
+            // already been sent, so the response cannot be completed honestly.
+            self.body_source = None;
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "file ended before Content-Length was satisfied",
+            ));
+        }
+        chunk.truncate(read);
+        source.remaining -= read as u64;
+        self.write_buf = chunk;
+        self.write_pos = 0;
+        Ok(true)
     }
 
     /// Response fully flushed and the connection is being kept alive: start
     /// over. Buffers are cleared rather than reallocated.
     fn reset_for_next_request(&mut self) {
         self.limit_narrowed = false;
+        self.body_source = None;
         self.write_buf.clear();
         self.write_pos = 0;
         self.state = State::ReadingHeaders;
@@ -460,8 +573,8 @@ impl Connection {
         match self.state {
             State::ReadingHeaders | State::ReadingBody if !mid_request => Action::Close,
             State::ReadingHeaders | State::ReadingBody => {
-                let bytes = error_response(408).to_bytes(false);
                 self.keep_alive = false;
+                let bytes = self.error_bytes(408);
                 self.queue(bytes, AfterWrite::Close);
                 // Give the 408 its own window to flush instead of being
                 // immediately re-reaped by the next sweep.
@@ -480,95 +593,190 @@ impl Connection {
     }
 }
 
-/// Build the response for a parsed request.
+/// Build the reply for a parsed request.
 ///
-/// Phase 4 selects the virtual host and resolves the route; the handlers that
-/// actually read files, write uploads and run scripts are TASKS.md phase 5 and
-/// 7. Everything the router decides on its own — redirects, 405 with `Allow`,
-/// 403, 404, 501 — is already final here.
-fn respond(servers: &[ServerConfig], request: &Request) -> Response {
+/// Sessions wrap everything: the cookie is read (or a session created) before
+/// routing, and a `Set-Cookie` is attached afterwards if one was issued. Doing
+/// it here rather than inside each handler means every response carries the
+/// session consistently, including error pages.
+fn build_reply(
+    servers: &[ServerConfig],
+    sessions: &Rc<RefCell<SessionStore>>,
+    request: &Request,
+) -> Reply {
+    let session = resolve_session(sessions, request);
+
+    let mut reply = if session_page::owns(&request.path) {
+        session_demo(sessions, request, &session)
+    } else {
+        route_request(servers, request)
+    };
+
+    // Only when a session was just issued: re-sending an unchanged cookie on
+    // every response is wasted bytes on every asset a page pulls in.
+    if let Some(state) = &session {
+        if state.is_new {
+            let cookie = SetCookie::new(session::COOKIE_NAME, &state.id)
+                .max_age(session::DEFAULT_TTL.as_secs() as i64);
+            if cookie.is_valid() {
+                reply.response = reply.response.header("Set-Cookie", cookie.to_string());
+            }
+        }
+    }
+    reply
+}
+
+/// The session attached to a request.
+struct SessionState {
+    id: String,
+    /// Created for this request, so a `Set-Cookie` is owed.
+    is_new: bool,
+}
+
+/// Find the request's session, or start one.
+///
+/// A cookie whose value is not shaped like an id this server issues is treated
+/// as absent, so a client cannot probe the map with arbitrary strings.
+fn resolve_session(
+    sessions: &Rc<RefCell<SessionStore>>,
+    request: &Request,
+) -> Option<SessionState> {
+    // `try_borrow_mut` rather than `borrow_mut`: a nested borrow would panic,
+    // and on the request path nothing may panic.
+    let mut store = sessions.try_borrow_mut().ok()?;
+
+    let presented = request
+        .headers
+        .get("cookie")
+        .map(cookie::parse)
+        .and_then(|pairs| cookie::get(&pairs, session::COOKIE_NAME).map(str::to_string))
+        .filter(|id| session::is_valid_id(id));
+
+    if let Some(id) = presented {
+        if store.touch(&id).is_some() {
+            return Some(SessionState { id, is_new: false });
+        }
+        // Known-shaped but expired or unknown: fall through and issue a new one.
+    }
+
+    store
+        .create()
+        .map(|id| SessionState { id, is_new: true })
+}
+
+/// Serve the `/session` demo.
+fn session_demo(
+    sessions: &Rc<RefCell<SessionStore>>,
+    request: &Request,
+    state: &Option<SessionState>,
+) -> Reply {
+    let state = match state {
+        Some(state) => state,
+        // No session could be issued at all.
+        None => return session_page::unavailable(),
+    };
+
+    let mut store = match sessions.try_borrow_mut() {
+        Ok(store) => store,
+        Err(_) => return Reply::immediate(error::builtin(500)),
+    };
+
+    match session_page::command(request) {
+        Command::Login(name) => {
+            store.set_value(&state.id, "name", &name);
+            session_page::redirect_to_self()
+        }
+        Command::Logout => {
+            store.destroy(&state.id);
+            // The cookie is cleared too, so the next request starts clean
+            // rather than presenting an id that no longer exists.
+            let mut reply = session_page::redirect_to_self();
+            let cleared = SetCookie::expired(session::COOKIE_NAME);
+            reply.response = reply.response.header("Set-Cookie", cleared.to_string());
+            reply
+        }
+        Command::Unknown => Reply::immediate(error::builtin(404)),
+        Command::Show => match store.get(&state.id) {
+            Some(session) => {
+                let snapshot = session.clone();
+                session_page::page(&state.id, &snapshot, &store, state.is_new)
+            }
+            None => session_page::unavailable(),
+        },
+    }
+}
+
+/// Select the virtual host, resolve the route, then hand off to the handler.
+fn route_request(servers: &[ServerConfig], request: &Request) -> Reply {
     let host = request.host();
     let server = match router::select_server(servers, host.as_deref()) {
         Some(server) => server,
         // A listener always has at least one server, so this cannot happen; if
-        // it somehow does, it is a server-side fault, not the client's.
-        None => return error_response(500),
+        // it somehow does it is a server fault, not the client's.
+        None => return Reply::immediate(error::builtin(500)),
     };
 
     let head_only = request.method_enum() == Some(Method::Head);
 
-    match router::resolve(server, request) {
-        Resolution::Redirect { status, location } => Response::html(
-            status,
-            format!(
-                "<!doctype html><html><head><meta charset=\"utf-8\"><title>{status}</title></head>\
-                 <body><p>Moved to <a href=\"{location}\">{location}</a></p></body></html>\n"
-            ),
-        )
-        .header("Location", &location)
-        .head_only(head_only),
-
-        // RFC 9110 requires Allow on a 405, so the client learns what it may
-        // use instead of guessing.
-        Resolution::MethodNotAllowed { allow } => {
-            error_response(405).header("Allow", &allow)
-        }
-
-        Resolution::Error(status) => error_response(status),
-
-        // Resolved successfully; the handler that performs the work lands in a
-        // later phase. Reporting the decision keeps routing verifiable now.
-        other => {
-            let plan = match &other {
-                Resolution::File { path } => format!("serve file {}", path.display()),
-                Resolution::Listing { path, url_path } => {
-                    format!("list directory {} at {url_path}", path.display())
-                }
-                Resolution::Cgi { interpreter, script, path_info } => format!(
-                    "run {} {} (PATH_INFO {:?})",
-                    interpreter.display(),
-                    script.display(),
-                    path_info
+    // Every handler returns `Result<Reply, u16>`, so a failure anywhere becomes
+    // the configured error page for that status by one path rather than each
+    // handler inventing its own response.
+    let outcome: Result<Reply, u16> = match router::resolve(server, request) {
+        Resolution::Redirect { status, location } => Ok(Reply::immediate(
+            Response::html(
+                status,
+                format!(
+                    "<!doctype html><html><head><meta charset=\"utf-8\">\
+                     <title>{status}</title></head><body>\
+                     <p>Moved to <a href=\"{location}\">{location}</a></p></body></html>\n"
                 ),
-                Resolution::Upload { dir } => format!("store upload in {}", dir.display()),
-                Resolution::Delete { path } => format!("delete {}", path.display()),
-                _ => String::new(),
-            };
-            let body = format!(
-                "LocalServer\n\
-                 server:  {}\n\
-                 method:  {}\n\
-                 path:    {}\n\
-                 plan:    {plan}\n\
-                 body:    {} bytes\n",
-                if server.server_names.is_empty() {
-                    "(default)".to_string()
-                } else {
-                    server.server_names.join(", ")
-                },
-                request.method,
-                request.path,
-                request.body.len(),
-            );
-            Response::with_body(200, "text/plain; charset=utf-8", body.into_bytes())
-                .head_only(head_only)
-        }
-    }
-}
+            )
+            .header("Location", &location)
+            .head_only(head_only),
+        )),
 
-/// A minimal error response.
-///
-/// Replaced in TASKS.md 5.5 by the pages configured per server; this is the
-/// built-in fallback that must always work, since an error page that itself
-/// fails would recurse.
-fn error_response(status: u16) -> Response {
-    let reason = crate::http::response::reason_phrase(status);
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <title>{status} {reason}</title></head>\
-         <body><h1>{status} {reason}</h1></body></html>\n"
-    );
-    Response::html(status, body).header("Connection", "close")
+        // RFC 9110 requires Allow on a 405 so the client learns what it may use.
+        Resolution::MethodNotAllowed { allow } => {
+            return Reply::immediate(error::page(server, 405).header("Allow", &allow))
+        }
+
+        Resolution::File { path } => handlers::file(&path, head_only),
+
+        Resolution::Listing { path, url_path } => handlers::listing(&path, &url_path, head_only),
+
+        Resolution::Upload { dir } => {
+            if handlers::upload_dir_usable(&dir) {
+                handlers::upload(&dir, request, &request.path)
+            } else {
+                Err(500)
+            }
+        }
+
+        Resolution::Delete { path } => handlers::delete(&path),
+
+        // TASKS.md 7.1 replaces this with the non-blocking CGI pump.
+        Resolution::Cgi { interpreter, script, path_info } => Ok(Reply::immediate(
+            Response::with_body(
+                200,
+                "text/plain; charset=utf-8",
+                format!(
+                    "CGI not implemented yet (TASKS.md phase 7)\n\
+                     interpreter: {}\nscript: {}\nPATH_INFO: {path_info:?}\n",
+                    interpreter.display(),
+                    script.display()
+                )
+                .into_bytes(),
+            )
+            .head_only(head_only),
+        )),
+
+        Resolution::Error(status) => Err(status),
+    };
+
+    match outcome {
+        Ok(reply) => reply,
+        Err(status) => Reply::immediate(error::page(server, status).head_only(head_only)),
+    }
 }
 
 #[cfg(test)]
@@ -611,12 +819,16 @@ mod tests {
         assert!(matches!(classify_write(Ok(0)), IoOutcome::Failed(_)));
     }
 
+    /// An error raised before any request exists still uses the listener's
+    /// default server, so a custom error page applies even to a request too
+    /// broken to name a host.
     #[test]
     fn error_responses_close_the_connection() {
-        let response = error_response(400);
+        let response = error::builtin(400).header("Connection", "close");
         assert_eq!(response.status, 400);
         assert_eq!(response.get_header("Connection"), Some("close"));
         let text = String::from_utf8_lossy(&response.to_bytes(false)).to_string();
         assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(text.contains("Bad Request"));
     }
 }

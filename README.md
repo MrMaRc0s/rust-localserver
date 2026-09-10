@@ -10,15 +10,15 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phases 0–4 complete: configuration, the event loop, HTTP/1.1 message parsing,
-and routing — virtual hosts, longest-prefix routes, per-route methods,
-redirects, directory rules and traversal defence. 152 passing tests, clean under
+Phases 0–6 complete. The server serves a real static site end to end: GET,
+HEAD, POST with file uploads, DELETE, directory listings, redirects, custom
+error pages, virtual hosts, and cookie-backed sessions — over a single-threaded
+non-blocking event loop. 204 passing tests, clean under
 `cargo clippy --all-targets`.
 
-Nothing is read from or written to disk yet — the handlers are Phase 5 of
-`TASKS.md`. A request that resolves to a file, listing, upload or script
-currently returns a summary of the routing decision; redirects, 405, 403, 404
-and 501 are already final.
+**CGI is the remaining gap** — a request routed to a script returns a
+placeholder naming the interpreter, script and `PATH_INFO` it would have used
+(Phase 7 of `TASKS.md`).
 
 ```bash
 cargo run --release -- config.yaml   # binds 8080, 8081, 8082
@@ -26,9 +26,10 @@ curl -i http://127.0.0.1:8080/
 echo $?                              # 2 if the configuration is unusable
 ```
 
-Measured with `siege -b -t20S http://127.0.0.1:8080/`: **100.00% availability**
-over 23,910 transactions, 0 failed, file descriptors back to baseline
-afterwards.
+Measured with `siege -b -t20S http://127.0.0.1:8080/empty.html`: **100.00%
+availability** over 81,555 transactions at 4006 trans/sec, 0 failed. File descriptors return to
+baseline and RSS stays flat — a 10 MB download moves it by 128 KB, because
+bodies are streamed rather than buffered.
 
 ## Build and run
 
@@ -45,6 +46,10 @@ Then open <http://127.0.0.1:8080/>.
 |---|---|
 | Concurrency | One process, one thread, one `mio::Poll`. Listeners, client sockets and CGI pipes are all tokens in the same `epoll`. |
 | Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. `mio` is edge-triggered, so a socket that may still hold data is **re-armed** with `EPOLL_CTL_MOD` rather than drained in a loop. |
+| File bodies | Streamed: a file over 64 KB stays on disk and is pulled one chunk per writable event, so memory never holds more than a chunk. Files under a chunk go out inline with their headers, saving two syscalls and two epoll re-arms on the traffic a static site is mostly made of. |
+| Error pages | The page configured for that status, else one compiled into the binary. The fallback is load-bearing: an error page that itself fails would otherwise recurse. |
+| Sessions | 32 bytes from `/dev/urandom`, hex-encoded, in a `HashMap` behind `Rc<RefCell<_>>` — **no `Mutex`**, because one thread means there is nothing to synchronise. Sliding 30-minute expiry, swept from the loop tick once a minute, capped at 10,000. If the CSPRNG is unreadable the server issues no sessions rather than weak ones. |
+| Cookies | `HttpOnly` and `SameSite=Lax` by default; `Secure` deliberately off, since a `Secure` cookie would never come back over plain HTTP. Values that could inject a header are refused rather than escaped. |
 | Blocking | Nothing blocks. Partial requests and partial responses live in per-connection buffers across loop iterations; CGI stdin/stdout are `O_NONBLOCK` pipes registered in the same `Poll`. |
 | Routing | `Host` selects the virtual host; routes match by longest prefix at segment boundaries. Order is fixed: redirect, method (405 with `Allow`), path sanitising, CGI, directory rules, file. A directory with no index and no autoindex is 403, not 404 — it exists, it just may not be enumerated. |
 | Traversal | Percent-decode, then normalise `..`, then `canonicalize` to catch symlinks out of the root. Decoding first is what makes `%2e%2e%2f` visible to the normaliser. |
@@ -99,6 +104,10 @@ The shipped file demonstrates each supported feature:
 | Upload destination | `upload_dir: uploads` |
 
 ## Layout
+
+Session behaviour is visible at <http://127.0.0.1:8080/session>: the id, a visit
+counter that climbs on reload, a sliding expiry, and a sign-in form. The cookie
+itself is in devtools under Application → Cookies.
 
 ```
 config.yaml     server configuration (edit this, not the code)

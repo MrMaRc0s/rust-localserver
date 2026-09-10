@@ -36,6 +36,7 @@
 // rather than merely discouraged (TASKS.md 2.7, the "never crash" rule).
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::io;
@@ -49,6 +50,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::config::{Config, ServerConfig};
 use crate::connection::{Action, Connection, Timeout};
+use crate::utils::session::{SessionStore, DEFAULT_TTL};
 
 /// Listener tokens occupy `[0, CONNECTION_TOKEN_BASE)`, connection tokens start
 /// at `CONNECTION_TOKEN_BASE`. Dispatch is then a single comparison, and a
@@ -62,6 +64,14 @@ const TICK: Duration = Duration::from_millis(500);
 
 /// Events collected per `poll()`.
 const EVENTS_CAPACITY: usize = 1024;
+
+/// How often expired sessions are swept.
+///
+/// Not every tick: sweeping walks the whole map, and doing that twice a second
+/// would make idle servers busy for no reason. Sessions expiring a minute late
+/// costs nothing — the lookup checks expiry itself, so a stale entry is never
+/// handed out, it just occupies memory a little longer.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Ceiling on simultaneous client connections.
 ///
@@ -106,6 +116,10 @@ pub struct Server {
     #[allow(dead_code)] // routing reads this from Phase 4 onward.
     config: Config,
     accepted: u64,
+    /// Shared with every connection. One thread means `Rc<RefCell<_>>` is
+    /// enough; see [`crate::utils::session`].
+    sessions: Rc<RefCell<SessionStore>>,
+    last_session_sweep: Instant,
 }
 
 impl Server {
@@ -198,6 +212,8 @@ impl Server {
             throttled: false,
             config,
             accepted: 0,
+            sessions: Rc::new(RefCell::new(SessionStore::new(DEFAULT_TTL))),
+            last_session_sweep: Instant::now(),
         })
     }
 
@@ -225,6 +241,7 @@ impl Server {
             // Runs on every iteration, including the ones where `poll` returned
             // because of the tick rather than because of traffic.
             self.sweep_timeouts();
+            self.sweep_sessions();
         }
     }
 
@@ -248,6 +265,7 @@ impl Server {
 
             let max_body = self.listeners[index].max_body;
             let servers = Rc::clone(&self.listeners[index].servers);
+            let sessions = Rc::clone(&self.sessions);
             let (socket, peer) = match self.listeners[index].socket.accept() {
                 Ok(pair) => pair,
                 // Backlog drained: the normal way out of this loop.
@@ -264,7 +282,7 @@ impl Server {
                 }
             };
 
-            self.register_connection(socket, peer, max_body, servers);
+            self.register_connection(socket, peer, max_body, servers, sessions);
         }
     }
 
@@ -274,6 +292,7 @@ impl Server {
         peer: SocketAddr,
         max_body: usize,
         servers: Rc<Vec<ServerConfig>>,
+        sessions: Rc<RefCell<SessionStore>>,
     ) {
         // Small responses should leave immediately rather than waiting for
         // Nagle to coalesce them with data that will never come.
@@ -295,7 +314,10 @@ impl Server {
         }
 
         self.connections
-            .insert(token, Connection::new(socket, peer, token, max_body, servers));
+            .insert(
+                token,
+                Connection::new(socket, peer, token, max_body, servers, sessions),
+            );
         self.accepted += 1;
     }
 
@@ -431,6 +453,25 @@ impl Server {
         }
         self.throttled = false;
         eprintln!("localserver: resuming accept");
+    }
+
+    /// Drop expired sessions, at most once a minute.
+    fn sweep_sessions(&mut self) {
+        if self.last_session_sweep.elapsed() < SESSION_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_session_sweep = Instant::now();
+        // A failed borrow would mean a connection is mid-request with the store
+        // open; skipping this sweep is harmless, the next one will catch up.
+        if let Ok(mut store) = self.sessions.try_borrow_mut() {
+            let dropped = store.sweep();
+            if dropped > 0 {
+                eprintln!(
+                    "localserver: swept {dropped} expired session(s), {} remain",
+                    store.len()
+                );
+            }
+        }
     }
 
     /// Enforce both deadlines on every connection, every iteration.

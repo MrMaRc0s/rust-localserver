@@ -105,6 +105,13 @@ impl Response {
         self
     }
 
+    /// Overwrite a header that was already set.
+    pub fn replace_header(mut self, name: &str, value: impl AsRef<str>) -> Response {
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.as_ref().to_string()));
+        self
+    }
+
     pub fn body(mut self, body: Vec<u8>) -> Response {
         self.body = body;
         self
@@ -139,9 +146,13 @@ impl Response {
             reason_phrase(self.status)
         );
 
+        // 204 and 304 are defined to carry no body, and RFC 9110 says not to
+        // send a Content-Length for them: some clients treat one as a promise
+        // of bytes that never arrive and hold the connection open.
+        let bodyless = matches!(self.status, 204 | 304);
         // Content-Length is mandatory unless the body is framed some other way.
         let framed = self.has_header("transfer-encoding");
-        if !framed && !self.has_header("content-length") {
+        if !bodyless && !framed && !self.has_header("content-length") {
             head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
         }
         if !self.has_header("date") {
@@ -298,6 +309,15 @@ mod tests {
     }
 
     /// A chunked response must not also carry a Content-Length.
+    #[test]
+    fn a_204_carries_neither_body_nor_length() {
+        let bytes = Response::new(204).to_bytes(true);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(!text.contains("Content-Length"), "204 must not announce a length");
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
     #[test]
     fn chunked_responses_get_no_content_length() {
         let bytes = Response::new(200)

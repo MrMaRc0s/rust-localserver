@@ -21,6 +21,180 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 6.1 — cookie utilities** (`src/utils/cookie.rs`): `Cookie:` header
+  parsing and a `SetCookie` builder covering `Path`, `Max-Age`, `HttpOnly`,
+  `Secure` and `SameSite`.
+  _Why:_ the two grammars are deliberately separate types. A request's `Cookie`
+  header is a flat `name=value; name=value` list with no attributes — a client
+  sends back only the pairs, never the `Path` or `HttpOnly` it was given — while
+  `Set-Cookie` carries one pair plus its attributes. Treating them as one format
+  is a common source of confusion.
+
+- **Cookie values that could inject headers are rejected, not escaped.**
+  _Why:_ a value containing `;` could smuggle in an extra attribute, and one
+  containing CRLF an entire extra response header. Refusing is a decision the
+  caller can see; escaping quietly changes what was asked for.
+
+- **Defaults chosen rather than inherited**: `HttpOnly` and `SameSite=Lax` on,
+  `Secure` deliberately off.
+  _Why:_ `HttpOnly` keeps the session id out of `document.cookie`, so a
+  scripting bug in a served page cannot read it. `SameSite=Lax` stops it riding
+  along on cross-site form posts. `Secure` is off because this server speaks
+  plain HTTP — a `Secure` cookie would simply never be sent back, and the
+  feature would look broken.
+
+- **Phase 6.2 — in-memory session store** (`src/utils/session.rs`) with sliding
+  expiry, a 30-minute TTL, and ids of 32 bytes from `/dev/urandom`, hex-encoded.
+  _Why:_ `[A-22]`. A guessable id **is** a session hijack — anyone who can
+  predict one is logged in as that user — so neither the clock nor a counter is
+  acceptable, and the kernel already has a CSPRNG. If `/dev/urandom` cannot be
+  read the store refuses to invent a weak id: it stops issuing sessions, says so
+  once, and the site keeps working without them. Serving without sessions is
+  better than serving forgeable ones.
+
+- **No locking, on purpose.** The store is a `HashMap` behind
+  `Rc<RefCell<_>>`, shared by every connection.
+  _Why:_ this is the honest answer to the subject's "use thread-safe data
+  structures" tip and worth saying out loud at the audit: there is exactly one
+  thread, so a `Mutex` would buy nothing but syscalls and a deadlock risk, and
+  `Arc` would pay for atomic refcounting that is never contended. The
+  single-threaded design *is* the synchronisation. `RefCell` still enforces the
+  borrow rules at runtime, and every borrow on the request path uses
+  `try_borrow_mut` rather than `borrow_mut`, because a nested borrow would panic
+  and nothing on the request path may panic.
+
+- **A cap of 10,000 sessions**, sweeping expired entries before refusing.
+  _Why:_ every request without a valid cookie creates a session, so a client
+  that ignores cookies would otherwise grow the map for as long as it kept
+  asking. Measured under `siege`: 81,555 requests left **33** sessions, because
+  siege keeps a cookie jar per simulated user and so behaves like a browser —
+  but the cap is what makes the pathological client harmless rather than
+  hopeful.
+
+- **Expired sessions swept from the event loop tick, once a minute** rather than
+  per request.
+  _Why:_ sweeping walks the whole map, so doing it per request would make each
+  one cost O(sessions), and doing it every 500 ms tick would keep an idle server
+  busy for nothing. Expiring a minute late costs nothing: the lookup checks
+  expiry itself, so a stale session is never handed out — it just occupies
+  memory slightly longer.
+
+- **`/session` demo page** showing the id, a visit counter, a sliding expiry
+  countdown, a sign-in form and a sign-out link. Linked from the index page.
+  _Why:_ sessions are invisible by nature, and "show me a working session and
+  cookie system" is answered by opening devtools → Application → Cookies. The
+  page makes the same thing visible without devtools — reload it and the counter
+  climbs. Sign-in redirects with **303 rather than 302** so a reload afterwards
+  does not re-post the form.
+
+- **20 new tests**: cookie parsing and rendering, header-injection refusal, id
+  shape and uniqueness, expiry and sliding renewal, the store cap, form parsing,
+  and that a stored name is HTML-escaped before it reaches the page. 204 in
+  total.
+
+### Changed
+
+- Session handling wraps the whole request path rather than living inside a
+  handler, and `Set-Cookie` is attached only when a session is newly issued.
+  _Why:_ doing it in one place means every response carries the session
+  consistently, error pages included. Re-sending an unchanged cookie on every
+  response would waste bytes on every asset a page pulls in — verified: the
+  first request to `/session` carries `Set-Cookie`, the next three do not, and
+  the visit counter still climbs 1, 2, 3.
+- A cookie whose value is not shaped like an id this server issues (64 hex
+  characters) is treated as absent.
+  _Why:_ it stops a client probing the session map with arbitrary strings, and
+  makes a mangled cookie from another application on the same host behave as no
+  cookie at all rather than as a failed lookup.
+
+
+- **Phase 5.1 — static file serving** (`src/handlers/mod.rs`) with
+  `Content-Length` and `Last-Modified` from the file's metadata, `Content-Type`
+  from the MIME table, and `HEAD` returning the length with no body.
+  _Why:_ `[A-17]`. Verified byte-exact: a 10 MB download and a 300 KB upload
+  both round-trip with matching SHA-256.
+
+- **Bodies are streamed, not slurped**: a file larger than 64 KB stays on disk
+  and is pulled one chunk per writable event.
+  _Why:_ `[A-33]`. Reading a large download into a `Vec` first would spike
+  memory by the file's size per concurrent client and stall the single thread
+  while it happened. Measured: serving a 10 MB file moved the server's RSS by
+  128 KB. Regular-file I/O is the one thing not driven by epoll, and that is not
+  a shortcut — `epoll` reports a regular file as always ready, so there is
+  nothing to wait for; chunking is what keeps a big download from monopolising
+  the loop, for the same reason as one socket read per event.
+
+- **Files that fit in one chunk are sent inline with their headers.**
+  _Why:_ streaming a 1 KB stylesheet costs three syscalls and two epoll re-arms
+  to move a few hundred bytes, and small files are most of a static site's
+  traffic. Memory is bounded either way (never more than one chunk). Worth
+  3.4× on the audit's own benchmark: `siege -b` on `/empty.html` went from 816
+  to **2805 trans/sec**, and `/index.html` from 276 to **989**.
+
+- **Phase 5.2 — uploads** accepting both shapes the audit uses:
+  `multipart/form-data` (a browser form or `curl -F`) and a raw body
+  (`curl --data-binary`). Answers `201` with a `Location`.
+  _Why:_ `[A-18]`, `[A-21]`. A filename that sanitises to nothing (`..`, a
+  dotfile, control characters) is **refused with 400 rather than silently
+  renamed**, so a client never believes it stored something it did not; a
+  traversing name keeps only its final component and lands inside the upload
+  directory, which has its own test.
+
+- **Phase 5.3 — DELETE** answering `204`, with `404` for a missing file and
+  `403` for a directory.
+  _Why:_ `[A-19]`. A 204 carries no body and, per RFC 9110, no
+  `Content-Length` either — some clients read one as a promise of bytes that
+  never arrive and hold the connection open. Demonstrated against `[A-16]`:
+  `DELETE /uploads/note.txt` → 204 then 404, while `DELETE /readonly/...` on
+  the same directory → 405 with `Allow: GET` and the file survives.
+
+- **Phase 5.4 — directory listings** with sizes, modification times, a parent
+  link (except at the route root, where it would leave the served tree), hidden
+  files omitted, and directories sorted first.
+  _Why:_ `[A-26]`. Names are **HTML-escaped for the link text and
+  percent-encoded for the href** — two encodings for two contexts. Using one for
+  both is the classic bug and lets a file named `<script>.txt` inject markup
+  into the page; there is a test for exactly that.
+
+- **Phase 5.5 — error pages** (`src/error.rs`): the page configured for that
+  status, else a built-in page compiled into the binary. Covers 400, 403, 404,
+  405, 408, 413, 500, 501, 505 and more.
+  _Why:_ `[A-12]`. The fallback is load-bearing, not a nicety: if a configured
+  page is missing or was deleted after startup validation approved it,
+  generating the error response would itself fail — and answering *that* with
+  another error page recurses. A page that needs no filesystem access and cannot
+  fail terminates the chain. A configured page larger than 256 KB is also
+  refused, so an ordinary 404 cannot be turned into a large allocation.
+  Errors raised **before** a request exists (a malformed request line, a
+  timeout) use the listener's default server, so a custom 400 page applies even
+  to a request too broken to name a host.
+
+- **26 new tests**: file serving and streaming thresholds, HEAD, upload
+  round-trip with binary content, unsafe and traversing filenames, delete
+  semantics, listing escaping and encoding, size formatting, error page
+  fallback. 178 in total.
+
+### Fixed
+
+- **Streamed responses stalled after the headers.** The same edge-triggered
+  problem as the read side, in the other direction: a *complete* write leaves
+  the socket writable with no state transition, so `EPOLLET` reports nothing
+  further and the queued body was never sent — clients received correct headers
+  and then hung waiting for a `Content-Length` worth of bytes.
+  _Why the rule differs by case:_ a **partial** write means the socket buffer
+  filled, and the peer draining it produces a genuine writable edge, so no
+  re-arm is needed. A **complete** write with more still to send has no such
+  edge coming, so it re-arms. Small in-memory responses hid this completely —
+  they fit in a single write, which is why every phase up to now passed.
+
+- **`Location` on an upload doubled the filename** when the URL already named
+  the file: `POST /uploads/note.txt` answered
+  `Location: /uploads/note.txt/note.txt`.
+  _Why:_ the header was built by appending the stored name to the request path,
+  which is only right when the path names a directory. Caught by a unit test
+  before it reached the live checks.
+
+
 - **Phase 4.1 — virtual host selection** (`src/router.rs`): `Host` (port
   stripped, lowercased) matched against `server_names`, falling back to the
   `is_default` server for that address and then to the first declared.
@@ -475,19 +649,25 @@ numbering in `TASKS.md`.
 
 ### Notes
 
-- Routing is complete, but **nothing is read from or written to disk yet**: a
-  request that resolves to a file, listing, upload, delete or CGI gets a
-  plain-text summary of the decision instead. The handlers that perform the work
-  are Phase 5 (and Phase 7 for CGI). Everything the router decides on its own —
-  redirects, 405 with `Allow`, 403, 404, 501 — is already final.
+- The server now serves a real static site end to end, with sessions: GET, HEAD,
+  POST with uploads, DELETE, directory listings, redirects, custom error pages,
+  virtual hosts and cookies. **CGI is the remaining gap** — a request that routes
+  to a script gets a placeholder response naming the interpreter, script and
+  `PATH_INFO` it would have used (Phase 7).
+- The `/session` paths are built in rather than configured, like the metrics
+  endpoint planned for Phase 8: they report on the server itself, so there is no
+  document root they could sensibly be mapped to. The prefix is a single
+  constant.
 - **Gap worth closing:** the edge-triggered deadlock fixed this phase is
   invisible to unit tests, which never touch a socket. Until the integration
   suite in Phase 9.1 exists there is no automated guard against it returning; it
   was caught by hand with a 700 KB POST.
 - `cargo build`, `cargo build --release` and `cargo clippy --all-targets` are
   clean; `cargo test` runs 117 passing tests.
-- **siege, 20 s, default 25 users, against the routed canned response**: 23,910
-  transactions, **100.00% availability**, 0 failed, 1136 trans/sec. File descriptors returned to the 7-descriptor baseline and no
+- **siege, 20 s, default 25 users, with sessions active**: `/empty.html` 81,555
+  transactions at 4006 trans/sec, **100.00% availability**, 0 failed. File
+  descriptors stayed at the 7-descriptor baseline, RSS moved 2552 kB → 2588 kB,
+  and 33 sessions were held afterwards. File descriptors returned to the 7-descriptor baseline and no
   `CLOSE_WAIT` sockets remained. The 99.5% target in `[A-32]` is met, though it
   must be re-measured once the filesystem is in the path.
 - Not yet done: `Method::Put`/`Options` parse but no handler implements them.
