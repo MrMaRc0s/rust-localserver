@@ -41,6 +41,7 @@ curl -i http://127.0.0.1:8080/cgi-bin/info.pl    # Perl CGI (A-39 bonus)
 ---
 
 ## 2. Browser Verification Checklist (Questions A-23..A-28)
+## 2. Browser Verification & Visual Audit Studio (http://127.0.0.1:8080/)
 
 Open Google Chrome or Firefox and navigate to `http://127.0.0.1:8080/`:
 1. **Network Panel Inspection ([`A-23`], [`A-24`])**:
@@ -64,6 +65,33 @@ Open Google Chrome or Firefox and navigate to `http://127.0.0.1:8080/`:
    - Open DevTools → **Application** (Storage) → **Cookies** → `http://127.0.0.1:8080`.
    - Verify `session_id` cookie is present with `HttpOnly` and `SameSite=Lax`.
    - Reload the page: observe visit counter increment (`Visits: 1` → `Visits: 2`).
+Open Google Chrome or Firefox and navigate to `http://127.0.0.1:8080/`. The site loads a complete **Interactive Visual Audit Dashboard** requiring **zero curl commands**:
+
+1. **🚀 Visual Audit Suite (`tab-audit`)**:
+   - Click **`▶ Run All Audit Tests (A-9 .. A-40)`** to run every compliance test sequentially.
+   - Each card displays real-time `[PASS]` status badges, HTTP status codes (`200`, `204`, `301`, `400`, `404`, `405`, `413`, `504`), response latencies, formatted RFC 9110 response headers, and response bodies.
+2. **📦 File Upload & SHA-256 Studio (`tab-upload`) ([`A-21`])**:
+   - Drag and drop any binary file. The client pre-computes SHA-256 via the Web Crypto API (`crypto.subtle.digest`), uploads it via `multipart/form-data` to `/uploads/`, downloads it back, and visually compares both checksums to verify zero corruption.
+3. **⚙️ CGI Execution Lab (`tab-cgi`) ([`A-18`], [`A-28`], [`A-39`])**:
+   - Click to execute Python (`hello.py`), Perl (`info.pl`), and POST form scripts.
+   - Click **`Timeout Test (slow.py)`** to observe non-blocking 504 Gateway Timeout handling without stalling the server.
+4. **🍪 Session & Cookie Manager (`tab-session`) ([`A-22`])**:
+   - Inspect active `localserver_session` cookie (`HttpOnly`, `SameSite=Lax`).
+   - Click **`Increment Visit Counter`** to see visits increment in memory.
+5. **🔀 Routes & Virtual Hosts Explorer (`tab-routes`) ([`A-11`], [`A-14`])**:
+   - Interactive table of all 6 routes. Switch between `localhost` and `test.com` virtual hosts on port 8080.
+6. **🛠️ HTTP Request Console (`tab-console`)**:
+   - Custom in-browser HTTP client for arbitrary request crafting and raw header inspection.
+7. **Live Telemetry Bar**:
+   - Real-time polling of `/admin/metrics.json` updating status (online pulse), uptime, total requests, open file descriptors (`/proc/self/fd`), and active sessions.
+
+*Alternative Direct Browser URLs for Manual Inspection:*
+- Custom 404: `http://127.0.0.1:8080/nonexistent` (renders custom styled body from `error_pages/404.html`)
+- 301 Redirect: `http://127.0.0.1:8080/old-page` (redirects automatically to `/index.html`)
+- Directory Autoindex: `http://127.0.0.1:8080/listing/` (renders HTML directory table)
+- Session Demo: `http://127.0.0.1:8080/session` (increments visit counter on reload)
+- Admin Dashboard: `http://127.0.0.1:8080/admin` (auto-refreshing telemetry view)
+- JSON Telemetry: `http://127.0.0.1:8080/admin/metrics.json` (raw JSON metrics)
 
 ---
 

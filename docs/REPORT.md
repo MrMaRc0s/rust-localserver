@@ -76,9 +76,12 @@ All Phases 0 through 10 are fully implemented, defensively hardened, and verifie
 - Machine-readable JSON endpoint at `GET /admin/metrics.json` without external JSON dependencies (`src/metrics.rs:138`).
 
 ### Phase 9 — Testing & Hardening — DONE (`A-32..35`)
+### Phase 9 — Testing, Hardening & Visual Audit Dashboard — DONE (`A-23..28,32..35`)
 - Comprehensive integration test suite (`tests/integration.rs`) with 16 automated tests covering keep-alive, pipelining, one-byte trickling, limits, vhosts, SHA-256 upload roundtrip, redirects, CGI timeout, garbage resilience, and admin metrics.
 - Executable manual audit script (`tests/audit.sh`) testing questions [A-9] through [A-28] with 20/20 PASS rate.
 - Asynchronous load and leak generator (`tests/stress.py`) verifying 100.00% availability (>2,200 req/s), 0 FD leaks, 0 lingering CLOSE_WAIT sockets, and 0 zombie processes.
+- Asynchronous load and leak generator (`tests/stress.py`) verifying 100.00% availability (>1,100 req/s), 0 FD leaks, 0 lingering CLOSE_WAIT sockets, and 0 zombie processes.
+- **Interactive Visual Audit Dashboard & Studio (`www/index.html`, `www/static/audit-console.js`, `www/static/style.css`)**: In-browser test runner testing all audit questions [A-9] through [A-40] with live response inspection, Web Crypto SHA-256 upload/download roundtrip verification, CGI execution lab, session management, and live telemetry.
 
 ### Phase 10 — Audit Rehearsal — DONE (`A-30,31`)
 - Deliberate misconfiguration test files:
@@ -132,6 +135,7 @@ All Phases 0 through 10 are fully implemented, defensively hardened, and verifie
 | 9.3 | Stress availability >=99.5%| ✅ DONE | A-32..34 | 100.00% availability via `tests/stress.py` |
 | 9.4 | Leak/hanging checks | ✅ DONE | A-33,34 | 0 FD leak, 0 CLOSE_WAIT, 0 zombies |
 | 9.5 | Browser pass | ✅ DONE | A-23..28 | Complete browser verification |
+| 9.5 | Visual Audit Dashboard | ✅ DONE | A-23..28 | Interactive browser test suite & telemetry |
 | 9.6 | `README.md` | ✅ DONE | A-1..8 | Documentation complete |
 | 10.1 | `AUDIT_NOTES.md` & `AUDIT_GUIDE.md` | ✅ DONE | A-1..40 | Detailed guides for all 40 questions |
 | 10.1 | `docs/AUDIT_NOTES.md` & `docs/AUDIT_GUIDE.md` | ✅ DONE | A-1..40 | Detailed guides for all 40 questions |

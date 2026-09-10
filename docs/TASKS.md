@@ -61,6 +61,9 @@ availability/fd-leak/CLOSE_WAIT checks without requiring the binary.
 | 9.6 | `README.md` | ✅ DONE | A-1..8 | `README.md` |
 | 10.1 | `AUDIT_NOTES.md` | ✅ DONE | A-1..40 | `AUDIT_NOTES.md` file:line per question |
 | 10.1 | `docs/AUDIT_NOTES.md` | ✅ DONE | A-1..40 | `docs/AUDIT_NOTES.md` file:line per question |
+| 9.5 | Visual Audit Dashboard | ✅ DONE | A-23..28 | Interactive browser test suite & telemetry at http://127.0.0.1:8080/ |
+| 9.6 | `README.md` | ✅ DONE | A-1..8 | Visual dashboard, architecture & run instructions |
+| 10.1 | `docs/AUDIT_NOTES.md` & `AUDIT_GUIDE.md` | ✅ DONE | A-1..40 | Detailed guides for all 40 questions |
 | 10.2 | `config.dup-port.yaml` / `config.partial-bad.yaml` | ✅ DONE | A-30,31 | `config.dup-port.yaml:30` `config.partial-bad.yaml:50` |
 
 ---

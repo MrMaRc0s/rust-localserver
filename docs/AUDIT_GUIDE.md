@@ -6,6 +6,11 @@ This guide is your complete reference manual for passing the **LocalServer** eva
 3. **How It Was Implemented**: Architectural rationale and design choices.
 4. **Live Demonstration Command**: The exact command or curl to run in front of the auditor.
 
+> [!IMPORTANT]
+> **Zero-Curl In-Browser Testing Available:**
+> LocalServer now features a full-fledged **Interactive Visual Audit Dashboard & Studio** at `http://127.0.0.1:8080/`. You can conduct the entire audit inside any web browser (Chrome, Firefox, Safari) without typing any `curl` commands in the terminal! Each question below includes both the **Browser UI Click Action** and the traditional **Terminal `curl` command**.
+
+
 ---
 
 ## Table of Contents
@@ -307,24 +312,41 @@ This guide is your complete reference manual for passing the **LocalServer** eva
   # Create a 20KB random binary file
   head -c 20480 /dev/urandom > /tmp/test_orig.bin
   ORIG_SHA=$(sha256sum /tmp/test_orig.bin | cut -d' ' -f1)
+  - **Browser UI**:
+    - Navigate to `http://127.0.0.1:8080/` and open the **`📦 File Upload & SHA-256 Studio`** tab. Drag-and-drop any binary file (or click card **`[A-21]`** on the Visual Audit Suite tab). The browser computes client SHA-256 via Web Crypto (`crypto.subtle.digest`), uploads it via `multipart/form-data` to `/uploads/`, downloads it back, and displays side-by-side matching hashes with a green `✓ Checksums Match: Binary Roundtrip 100% Intact` badge.
+  - **Terminal**:
+    ```bash
+    # Create a 20KB random binary file
+    head -c 20480 /dev/urandom > /tmp/test_orig.bin
+    ORIG_SHA=$(sha256sum /tmp/test_orig.bin | cut -d' ' -f1)
 
   # Upload via multipart
   curl -F "file=@/tmp/test_orig.bin;filename=audit_check.bin" http://127.0.0.1:8080/uploads
+    # Upload via multipart
+    curl -F "file=@/tmp/test_orig.bin;filename=audit_check.bin" http://127.0.0.1:8080/uploads
 
   # Download and compare SHA256
   curl -s http://127.0.0.1:8080/uploads/audit_check.bin > /tmp/test_down.bin
   DOWN_SHA=$(sha256sum /tmp/test_down.bin | cut -d' ' -f1)
+    # Download and compare SHA256
+    curl -s http://127.0.0.1:8080/uploads/audit_check.bin > /tmp/test_down.bin
+    DOWN_SHA=$(sha256sum /tmp/test_down.bin | cut -d' ' -f1)
 
   echo "Original:   $ORIG_SHA"
   echo "Downloaded: $DOWN_SHA"
   [ "$ORIG_SHA" = "$DOWN_SHA" ] && echo "INTEGRITY VERIFIED: Identical SHA256!"
   ```
+    echo "Original:   $ORIG_SHA"
+    echo "Downloaded: $DOWN_SHA"
+    [ "$ORIG_SHA" = "$DOWN_SHA" ] && echo "INTEGRITY VERIFIED: Identical SHA256!"
+    ```
 
 ---
 
 ### Q22: A working session and cookies system is present on the server?
 - **Verbal Answer**:
   "Yes. The server has an in-memory session store generating 256-bit cryptographically secure session IDs from `/dev/urandom`. Sessions are tracked via an `HttpOnly`, `SameSite=Lax` cookie named `localserver_session`. Each request slidingly extends the session TTL (30 minutes). We provide a live demo at `/session` displaying the session ID, visit counter, and login state."
+  "Yes. The server has an in-memory session store generating 256-bit cryptographically secure session IDs from `/dev/urandom`. Sessions are tracked via an `HttpOnly`, `SameSite=Lax` cookie named `localserver_session`. Each request slidingly extends the session TTL (30 minutes). We provide a live demo at `/session` and within the browser dashboard displaying the session ID, visit counter, and login state."
 - **Code Locations**:
   - Secure session ID generation: `src/utils/session.rs:183-201`
   - Cookie security flags: `src/utils/cookie.rs:53-71`
@@ -336,6 +358,16 @@ This guide is your complete reference manual for passing the **LocalServer** eva
   # Request 2 -> sends cookie back, visit counter increments to 2:
   curl -b /tmp/cookies.txt -i http://127.0.0.1:8080/session
   ```
+  - **Browser UI**:
+    - Navigate to the **`🍪 Sessions & Cookies`** tab on `http://127.0.0.1:8080/` (or click card **`[A-22]`**). Click "Increment Visit Counter" to see the visit count increment. Inspect DevTools → Application → Cookies to view `localserver_session` with `HttpOnly` and `SameSite=Lax`.
+    - Alternatively, open `http://127.0.0.1:8080/session` directly in the browser.
+  - **Terminal**:
+    ```bash
+    # Request 1 -> receives Set-Cookie and visit 1:
+    curl -c /tmp/cookies.txt -i http://127.0.0.1:8080/session
+    # Request 2 -> sends cookie back, visit counter increments to 2:
+    curl -b /tmp/cookies.txt -i http://127.0.0.1:8080/session
+    ```
 
 ---
 
@@ -344,44 +376,62 @@ This guide is your complete reference manual for passing the **LocalServer** eva
 ### Q23: Is the browser connecting with the server with no issues?
 - **Verbal Answer**:
   "Yes. Open any browser (Chrome, Firefox) and navigate to `http://127.0.0.1:8080/`. The static site renders cleanly with CSS styles and images."
+  "Yes. Open any browser (Chrome, Firefox, Safari) and navigate to `http://127.0.0.1:8080/`. The site renders cleanly with CSS styles, logos, responsive tabs, and live telemetry without console errors or failed asset requests."
 - **Live Demo**:
   Open browser at `http://127.0.0.1:8080/`.
+  - **Browser UI**: Open `http://127.0.0.1:8080/`. Notice the live pulsating green indicator, real-time uptime, and live request counters.
+  - **Terminal**: `curl -i http://127.0.0.1:8080/`
 
 ---
 
 ### Q24: Are the request and response headers correct?
 - **Verbal Answer**:
   "All response headers follow RFC 9110:
+  "All response headers strictly conform to RFC 9110:
   - `HTTP/1.1 200 OK`
   - `Date: <IMF-fixdate>` (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`)
   - `Server: localserver/0.1.0`
   - `Content-Type: text/html; charset=utf-8` (or image/png, text/css)
+  - `Date: <IMF-fixdate>` (e.g. `Thu, 10 Sep 2026 17:02:05 GMT`)
+  - `Server: localserver`
+  - `Content-Type: text/html; charset=utf-8` (or `image/png`, `text/css`, etc.)
   - `Content-Length: <bytes>`
   - `Connection: keep-alive` (or `close`)"
+  - `Connection: keep-alive` (or `close`)
+  - `Access-Control-Allow-Origin: *` (for cross-port testing)
+  - `Set-Cookie: localserver_session=...; Path=/; Max-Age=1800; HttpOnly; SameSite=Lax`"
 - **Live Demo**:
   ```bash
   curl -i http://127.0.0.1:8080/
   ```
+  - **Browser UI**: Click card **`[A-24] Inspect Headers`** in the Visual Audit Suite tab. The response inspector displays an organized table of all returned headers and latency.
+  - **Terminal**: `curl -i http://127.0.0.1:8080/`
 
 ---
 
 ### Q25: Try a wrong URL on the server, is it handled properly?
 - **Verbal Answer**:
   "Returns 404 Not Found with the custom error page from `error_pages/404.html`."
+  "Returns 404 Not Found with the custom error page body from `error_pages/404.html`. Traversal attempts (such as `../`) are caught and returned as 403 Forbidden or 404 Not Found without escaping the root."
 - **Live Demo**:
   ```bash
   curl -i http://127.0.0.1:8080/does_not_exist
   ```
+  - **Browser UI**: Click card **`[A-25] Test Traversal`** or card **`[A-12] Trigger 404`** to visually inspect the custom 404 error page.
+  - **Terminal**: `curl -i http://127.0.0.1:8080/does_not_exist`
 
 ---
 
 ### Q26: Try to list a directory, is it handled properly?
 - **Verbal Answer**:
   "On routes where `autoindex: true` is set (e.g., `/listing/`), requesting a directory generates an HTML directory listing with directory-first sorting, file sizes, and HTML-escaped links. If `autoindex: false` and no index file exists, it returns `403 Forbidden`."
+  "On routes where `autoindex: true` is set (e.g., `/listing/`), requesting a directory dynamically generates an HTML directory listing with directory-first sorting, file sizes, and HTML-escaped links. If `autoindex: false` and no index file exists, it returns `403 Forbidden`."
 - **Live Demo**:
   ```bash
   curl -i http://127.0.0.1:8080/listing/
   ```
+  - **Browser UI**: Click card **`[A-26] Fetch Autoindex`** or navigate to `http://127.0.0.1:8080/listing/` to view the styled HTML file table.
+  - **Terminal**: `curl -i http://127.0.0.1:8080/listing/`
 
 ---
 
@@ -393,6 +443,12 @@ This guide is your complete reference manual for passing the **LocalServer** eva
   curl -i http://127.0.0.1:8080/old-page
   curl -iL http://127.0.0.1:8080/old-page
   ```
+  - **Browser UI**: Click card **`[A-27] Test 301 Redirect`** to inspect the 301 response, or type `http://127.0.0.1:8080/old-page` into the browser URL bar to watch the browser automatically redirect to `/index.html`.
+  - **Terminal**:
+    ```bash
+    curl -i http://127.0.0.1:8080/old-page
+    curl -iL http://127.0.0.1:8080/old-page
+    ```
 
 ---
 
@@ -412,9 +468,23 @@ This guide is your complete reference manual for passing the **LocalServer** eva
   5
   pedia
   0
+  - **Browser UI**: Switch to the **`⚙️ CGI Execution Lab`** tab or click card **`[A-28 / A-39]`** on the Visual Audit Suite tab to run Python and Perl CGI scripts and observe formatted stdout/stderr.
+  - **Terminal**:
+    ```bash
+    # Unchunked CGI request:
+    curl -i -X POST http://127.0.0.1:8080/cgi-bin/hello.py -d "greeting=hello_standard"
+    # Chunked CGI request:
+    curl -i -X POST http://127.0.0.1:8080/cgi-bin/hello.py -H "Transfer-Encoding: chunked" --data-binary @- <<EOF
+    4
+    wiki
+    5
+    pedia
+    0
 
   EOF
   ```
+    EOF
+    ```
 
 ---
 

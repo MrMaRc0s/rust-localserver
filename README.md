@@ -44,6 +44,19 @@ cargo build --release
 
 Then open <http://127.0.0.1:8080/>.
 
+## Visual Audit Dashboard & Interactive Test Studio
+
+Opening <http://127.0.0.1:8080/> in any browser loads an interactive web dashboard designed specifically for evaluating and demonstrating LocalServer without typing terminal `curl` commands:
+
+- **🚀 Visual Audit Suite (`tab-audit`)**: Single-click `▶ Run All Audit Tests (A-9 .. A-40)` or test individual cards. Displays real-time status code badges (`200`, `204`, `301`, `400`, `404`, `405`, `413`, `504`), response latencies in milliseconds, RFC 9110 response headers, and body previews.
+- **📦 File Upload & SHA-256 Studio (`tab-upload`)**: Drag-and-drop file upload using `multipart/form-data`. Computes pre-upload and post-download SHA-256 checksums via the browser Web Crypto API to visually prove 100% binary roundtrip integrity.
+- **⚙️ CGI Execution Lab (`tab-cgi`)**: Execute Python (`hello.py`), Perl (`info.pl`), and POST form scripts. Demonstrates non-blocking execution and 10-second timeout enforcement (`slow.py` → 504) without stalling other connections.
+- **🍪 Sessions & Cookies (`tab-session`)**: Inspect active `localserver_session` cookies, click to increment visit counters, and reset sessions live.
+- **🔀 Routes & Virtual Hosts (`tab-routes`)**: Inspect all 6 configured routes and test virtual host switching (`localhost` vs `test.com`) on port 8080 with immediate visual feedback.
+- **🛠️ HTTP Request Console (`tab-console`)**: An in-browser HTTP client to craft custom requests (GET, POST, DELETE, HEAD, etc.) with custom headers and bodies.
+- **Live Telemetry Bar**: Real-time polling of `/admin/metrics.json` displaying server state (pulsating online indicator), uptime, total requests, open file descriptors (`/proc/self/fd`), and active sessions.
+
+
 ## Design
 
 | Concern | Approach |
@@ -138,8 +151,12 @@ filesystem paths are in `SCRIPT_FILENAME` and `PATH_TRANSLATED`.
 
 ```
 config.yaml     server configuration (edit this, not the code)
-www/            static site: index.html, empty.html, static/style.css, static/logo.png
-                /listing (no index, autoindex) and /site2 (the test.com virtual host)
+www/            static site & visual audit dashboard:
+                - index.html: tabbed visual audit dashboard & interactive test suite
+                - static/audit-console.js: automated in-browser test runner & telemetry client
+                - static/style.css: responsive dark-theme dashboard UI
+                - static/logo.png: brand asset
+                - /listing (no index, autoindex) and /site2 (the test.com virtual host)
 error_pages/    400, 403, 404, 405, 408, 413, 500, 501
 cgi-bin/        CGI scripts: hello.py, form.py, info.pl, slow.py and data.txt
 uploads/        upload destination (contents git-ignored)
@@ -152,6 +169,10 @@ cargo test                       # full unit (246) + integration (16) suite = 26
 ./tests/audit.sh                 # curl automated walkthrough of audit questions [A-9..28]
 python3 tests/stress.py          # async stress harness (simulates siege -b -c 25 -t 10s)
 siege -b 127.0.0.1:8080/empty.html   # availability target: >= 99.5% (if siege binary is installed)
+
+# Or test interactively in the browser without curl:
+# 1. cargo run --release -- config.yaml
+# 2. Open http://127.0.0.1:8080/ and click "▶ Run All Audit Tests (A-9 .. A-40)"
 ```
 
 ## License

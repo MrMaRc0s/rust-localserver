@@ -19,6 +19,25 @@ numbering in `TASKS.md`.
 
 ## [Unreleased]
 
+### Added — Interactive Visual Audit Dashboard & Studio (2026-09-10)
+
+- **Interactive Visual Audit Dashboard** (`www/index.html`, `www/static/audit-console.js`, `www/static/style.css`):
+  - Comprehensive tabbed browser interface on `/` featuring a live Visual Audit Suite, File Upload & SHA-256 Studio, CGI Lab, Session Manager, Routes/Vhosts Explorer, and Custom HTTP Request Console.
+  - _Why:_ Allows evaluating and demonstrating all audit questions (`[A-9]` through `[A-40]`) with single-click browser tests, status code badges, latencies, RFC 9110 response headers, and formatted body previews without typing terminal `curl` commands.
+- **Web Crypto SHA-256 Roundtrip Verification** (`www/static/audit-console.js`):
+  - In-browser SHA-256 hashing via `crypto.subtle.digest` before upload and after download, providing side-by-side verification of binary integrity.
+  - _Why:_ Provides visual proof of zero corruption during multipart form uploads (`[A-21]`).
+- **Standard CORS Headers** (`src/http/response.rs`):
+  - Emits `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: *`, `Access-Control-Allow-Headers: *`.
+  - _Why:_ Enables browser `fetch()` on port 8080 to test ports 8081 and 8082 without browser cross-origin blocks.
+- **Virtual Host Testing Support (`X-Host`)** (`src/http/request.rs`):
+  - Request parser checks `X-Host` header fallback when `Host` cannot be modified by browser `fetch()`.
+  - _Why:_ Allows testing virtual host selection (`localhost` vs `test.com`) directly from the browser interface.
+- **Zombie Process Elimination & Hangup Cleanup** (`src/cgi.rs`, `src/server.rs`):
+  - `into_response_and_child()` passes `Child` to `Server.pending_reap` for non-blocking reaping via `try_wait()` and `waitpid(-1, WNOHANG)`.
+  - `dispatch()` handles `event.is_read_closed()` to close sockets promptly on client hangup.
+  - _Why:_ Guarantees 0 zombie processes and 0 file descriptor leaks under heavy concurrent stress testing (`[A-33]`, `[A-34]`).
+
 ### Fixed & Security — Adversarial Audit Hardening (2026-09-10)
 
 - **HEAD on 405 + `/session` now omits body** (`src/connection.rs`):

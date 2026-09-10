@@ -42,12 +42,17 @@ extern "C" fn cleanup_server() {
 
 struct ServerProcess {
     child: Child,
+    child: Option<Child>,
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -56,18 +61,31 @@ static SERVER: OnceLock<Mutex<ServerProcess>> = OnceLock::new();
 fn ensure_server() {
     SERVER.get_or_init(|| {
         let bin = env!("CARGO_BIN_EXE_localserver");
+        let ports = [8080, 8081, 8082];
+        let all_responding = ports.iter().all(|&port| {
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok()
+        });
+        if all_responding {
+            return Mutex::new(ServerProcess { child: None });
+        }
 
         // If an earlier process just terminated, wait up to 2s for ports to release
         for &port in &[8080, 8081, 8082] {
+        // Wait up to 3s for any lingering socket on these ports to be fully released
+        for &port in &ports {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(2) {
+            while start.elapsed() < Duration::from_secs(3) {
                 if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
                     break;
                 }
                 thread::sleep(Duration::from_millis(100));
             }
         }
+
+        let bin = env!("CARGO_BIN_EXE_localserver");
 
         // Spawn server process configured with config.yaml
         let mut cmd = Command::new(bin);
@@ -103,6 +121,7 @@ fn ensure_server() {
         }
 
         Mutex::new(ServerProcess { child })
+        Mutex::new(ServerProcess { child: Some(child) })
     });
 }
 
