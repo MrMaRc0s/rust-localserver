@@ -5,8 +5,8 @@ single `epoll` instance** (via [`mio`](https://docs.rs/mio)). No async runtime,
 no server framework — `mio` supplies readiness notifications and nothing else.
 
 > Zone01 `rust-localserver` project. The implementation plan lives in
-> [`TASKS.md`](TASKS.md); it maps every task to the audit questions in
-> [`audit.md`](audit.md).
+> [`docs/TASKS.md`](docs/TASKS.md); it maps every task to the audit questions in
+> [`docs/audit.md`](docs/audit.md).
 
 ## Status
 
@@ -65,23 +65,27 @@ Then open <http://127.0.0.1:8080/>.
 ### Module map
 
 ```
-src/main.rs             entry point: args, config load, start server
-src/config/mod.rs       Config / ServerConfig / RouteConfig
-src/config/parser.rs    hand-written YAML-subset parser
-src/config/validate.rs  startup validation (duplicate ports, paths, body limits)
-src/server.rs           the event loop: Poll, listeners, connection registry
-src/connection.rs       per-client state machine, the only client socket I/O
-src/http/request.rs     incremental request parser
-src/http/chunked.rs     chunked transfer decoder / encoder
-src/http/response.rs    response building and serialization
-src/router.rs           Host + path -> route resolution
-src/handlers/mod.rs     static files, uploads, delete, autoindex, redirects
-src/cgi.rs              CGI spawn and non-blocking pipe pumping
-src/error.rs            status codes -> error pages
-src/utils/session.rs    in-memory session store
-src/utils/cookie.rs     Cookie / Set-Cookie
-src/utils/mime.rs       extension -> Content-Type
-src/utils/path.rs       path resolution and traversal sanitising
+src/main.rs                  entry point: args, config load, start server
+src/config/mod.rs            Config / ServerConfig / RouteConfig
+src/config/parser.rs         hand-written YAML-subset parser
+src/config/validate.rs       startup validation (duplicate ports, paths, body limits)
+src/server.rs                the event loop: Poll, listeners, connection registry
+src/connection.rs            per-client state machine, the only client socket I/O
+src/http/mod.rs              re-export hub for http types
+src/http/request.rs          incremental request parser
+src/http/chunked.rs          chunked transfer decoder / encoder
+src/http/multipart.rs        multipart/form-data parser & filename sanitising
+src/http/response.rs         response building and serialization
+src/router.rs                Host + path -> route resolution
+src/handlers/mod.rs          static files, uploads, delete, autoindex, redirects
+src/handlers/session_page.rs  /session demo page (visit counter, login)
+src/cgi.rs                   CGI spawn and non-blocking pipe pumping
+src/error.rs                 status codes -> error pages
+src/utils/mod.rs             re-export hub
+src/utils/session.rs         in-memory session store
+src/utils/cookie.rs          Cookie / Set-Cookie
+src/utils/mime.rs            extension -> Content-Type
+src/utils/path.rs            path resolution and traversal sanitising
 ```
 
 ## Configuration
@@ -123,10 +127,10 @@ filesystem paths are in `SCRIPT_FILENAME` and `PATH_TRANSLATED`.
 
 ```
 config.yaml     server configuration (edit this, not the code)
-www/            static site: index, CSS, image, /listing (no index, autoindex)
-                and /site2 (the test.com virtual host)
+www/            static site: index.html, empty.html, static/style.css, static/logo.png
+                /listing (no index, autoindex) and /site2 (the test.com virtual host)
 error_pages/    400, 403, 404, 405, 408, 413, 500, 501
-cgi-bin/        CGI scripts
+cgi-bin/        CGI scripts: hello.py, form.py, info.pl, slow.py and data.txt
 uploads/        upload destination (contents git-ignored)
 ```
 

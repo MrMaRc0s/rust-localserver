@@ -121,6 +121,8 @@ You must implement unit tests within your `LocalServer` project to ensure your p
 ├── error_pages/          # Static error page files
 ```
 
+> **Note:** Simplified illustration — the canonical layout is defined in `TASKS.md` Phase 0 Task 0.1. Actual `src/` splits `config.rs` into `config/{mod,parser,validate}.rs`, expands `http/` to `{mod,request,chunked,multipart,response}.rs` (`multipart` — Phase 3.3), `handlers/` to `{mod,session_page}.rs` (`session_page` — Phase 6.2), and `utils/` to `{mod,session,cookie,mime,path}.rs`; `src/connection.rs` is also present. `Cargo.toml` enables `mio` with `os-poll`, `net`, `os-ext` (`os-ext` for `SourceFd` CGI pipes).
+
 ### Tips
 
 - Avoid hardcoding; use the config file.

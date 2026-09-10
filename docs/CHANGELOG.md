@@ -636,11 +636,11 @@ numbering in `TASKS.md`.
 
 
 - **Phase 0.1 — Cargo project and module tree.** `cargo init --name localserver`
-  (edition 2021) with `mio 1.2` (`os-poll`, `net`) and `libc 0.2` as the only
+  (edition 2021) with `mio 1.2` (`os-poll`, `net`, `os-ext`) and `libc 0.2` as the only
   dependencies. Created `src/config/{mod,parser,validate}.rs`, `src/server.rs`,
-  `src/connection.rs`, `src/http/{mod,request,chunked,response}.rs`,
-  `src/router.rs`, `src/handlers/mod.rs`, `src/cgi.rs`, `src/error.rs`,
-  `src/utils/{mod,session,cookie,mime,path}.rs`.
+  `src/connection.rs`, `src/http/{mod,request,chunked,multipart,response}.rs`,
+  `src/router.rs`, `src/handlers/{mod,session_page}.rs`, `src/cgi.rs`, `src/error.rs`,
+  `src/utils/{mod,session,cookie,mime,path}.rs` (`multipart` added in Phase 3.3, `session_page` in Phase 6.2; `os-ext` provides `SourceFd` for CGI pipes).
   _Why:_ the audit is conducted by reading the source aloud ("show me where you
   check the return value of `write`"). A flat `main.rs` turns every such question
   into an archaeology exercise; one file per concern makes each answer a jump to a

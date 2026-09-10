@@ -10,6 +10,55 @@ Audit questions are referenced as `[A-n]`; the full mapping is at the bottom.
 install before Phase 9 (`sudo apt install siege` or build from
 https://github.com/JoeDog/siege).
 
+## Tracker — status at a glance (see `REPORT.md` for the full report)
+
+> **Legend:** ✅ done & tested · 🟨 code correct / automation missing · ⬜ not started. Updated 2026-09-10; `cargo test` 221 passed, `clippy` 0 warnings. Progress: **32/40 done, 3 partial, 5 todo** (mandatory remainder: 9.1 integ +9.2+9.3+10.1+10.2; plus bonus 8.1).
+
+| ID | Phase — Task | Status | Audit | Source |
+|---|---|---|---|---|
+| 0.1 | Cargo + module tree | ✅ DONE | — | `Cargo.toml:12,24` `src/**/*.rs` |
+| 0.2 | Repo scaffolding | ✅ DONE | — | `config.yaml` `www/` `error_pages/` `cgi-bin/` `uploads/` |
+| 1.1 | Config data model | ✅ DONE | A-9..16 | `src/config/mod.rs:40` |
+| 1.2 | Hand-written parser | ✅ DONE | A-30,37 | `src/config/parser.rs` |
+| 1.3 | Startup validation | ✅ DONE | A-30,31 | `src/config/validate.rs:41` |
+| 1.4 | Tests: config | ✅ DONE | A-37 | `validate.rs:366` 41 tests |
+| 2.1 | Listeners in one `Poll` | ✅ DONE | A-11 | `src/server.rs:159` |
+| 2.2 | The loop | ✅ DONE | A-2..4,8 | `src/server.rs:252` |
+| 2.3 | Accept loop | ✅ DONE | A-20 | `src/server.rs:288` |
+| 2.4 | One read/write per event | ✅ DONE | A-5 | `src/connection.rs:303` |
+| 2.5 | Error & client removal | ✅ DONE | A-6,7,33 | `connection.rs:126` `server.rs:439` |
+| 2.6 | Timeouts | ✅ DONE | A-34 | `connection.rs:614` `server.rs:819` |
+| 2.7 | Never crash | ✅ DONE | A-20 | `server.rs:165,367` `connection.rs:63` |
+| 3.1 | Request line + headers | ✅ DONE | A-36 | `src/http/request.rs` |
+| 3.2 | Body: CL + chunked | ✅ DONE | A-13,28 | `request.rs:299` `chunked.rs` |
+| 3.3 | Multipart upload | ✅ DONE | A-21 | `src/http/multipart.rs` |
+| 3.4 | Response builder | ✅ DONE | A-24 | `src/http/response.rs` |
+| 3.5 | Tests: HTTP parsing | ✅ DONE | A-36 | `request.rs:560` |
+| 4.1 | Vhost selection | ✅ DONE | A-11,29 | `src/router.rs:72` |
+| 4.2 | Route matching | ✅ DONE | A-14..16,27 | `router.rs:93` |
+| 4.3 | Path sanitising | ✅ DONE | A-25 | `src/utils/path.rs` |
+| 4.4 | Tests: route matching | ✅ DONE | A-38 | `router.rs:306` |
+| 5.1 | GET | ✅ DONE | A-17,33 | `src/handlers/mod.rs:83` |
+| 5.2 | POST | ✅ DONE | A-18,21 | `handlers/mod.rs:145` |
+| 5.3 | DELETE | ✅ DONE | A-19,16 | `handlers/mod.rs:130` |
+| 5.4 | Directory listing | ✅ DONE | A-26 | `handlers/mod.rs:247` |
+| 5.5 | Error pages | ✅ DONE | A-12 | `src/error.rs:31` |
+| 6.1 | Cookie utils | ✅ DONE | A-22 | `src/utils/cookie.rs` |
+| 6.2 | Session store + `/session` | ✅ DONE | A-22 | `session.rs` `handlers/session_page.rs` |
+| 7.1 | Non-blocking CGI | ✅ DONE | A-8 | `src/cgi.rs:210` `server.rs:514` |
+| 7.2 | CGI environment | ✅ DONE | — | `cgi.rs:89` |
+| 7.3 | CGI translation + timeout | ✅ DONE | A-28 | `cgi.rs:497` `server.rs:766` |
+| 7.4 | Second CGI (`info.pl`) | ✅ DONE | **A-39** bonus | `cgi-bin/info.pl` `config.yaml:79` |
+| 8.1 | `/admin` metrics | ⬜ TODO (bonus) | **A-40** bonus | — |
+| 9.1 | `cargo test` suite | 🟨 PARTIAL | A-35 | unit ✅ `tests/*.rs` ❌ |
+| 9.2 | `tests/audit.sh` | ⬜ TODO | A-9..22 | — |
+| 9.3 | `siege` stress `≥99.5%` | ⬜ TODO | A-32..34 | binary missing |
+| 9.4 | Leak/hanging checks | 🟨 PARTIAL | A-33,34 | code ✅ automation ❌ |
+| 9.5 | Browser pass | 🟨 PARTIAL | A-23..28 | manual ✅ checklist ❌ |
+| 9.6 | `README.md` | ✅ DONE | A-1..8 | `README.md` |
+| 10.1 | `AUDIT_NOTES.md` | ⬜ TODO | A-1..8 | — |
+| 10.2 | `config.dup-port.yaml` / `config.partial-bad.yaml` | ⬜ TODO | A-30,31 | — |
+
 ---
 
 ## Architecture decisions (settle these before writing code)
@@ -34,26 +83,31 @@ and let every task below follow from them.
 ### Task 0.1 — Cargo project + module tree
 **Do:** `cargo init --name localserver`. Create the module tree:
 ```
-src/main.rs          entry point: parse args, load config, start server
-src/config/mod.rs    config structs (ServerConfig, RouteConfig)
-src/config/parser.rs hand-written YAML-subset parser
-src/config/validate.rs startup validation (ports, paths, body limits)
-src/server.rs        event loop, Poll, listeners, connection registry
-src/connection.rs    per-client state machine (ReadingHeaders/ReadingBody/Writing/Closing)
-src/http/mod.rs
-src/http/request.rs  request parser (request line, headers, body)
-src/http/chunked.rs  chunked transfer decoder/encoder
-src/http/response.rs response builder + serialization
-src/router.rs        host+path -> route resolution
-src/handlers/mod.rs  static files, upload, delete, directory listing, redirect
-src/cgi.rs           CGI process spawn + non-blocking pipe pumping
-src/error.rs         status codes -> error pages
-src/utils/session.rs in-memory session store
-src/utils/cookie.rs  Cookie / Set-Cookie parse & build
-src/utils/mime.rs    extension -> Content-Type
-src/utils/path.rs    path resolution + traversal sanitising
+src/main.rs                  entry point: parse args, load config, start server
+src/config/mod.rs            config structs (ServerConfig, RouteConfig)
+src/config/parser.rs         hand-written YAML-subset parser
+src/config/validate.rs       startup validation (ports, paths, body limits)
+src/server.rs                event loop, Poll, listeners, connection registry
+src/connection.rs            per-client state machine (ReadingHeaders/ReadingBody/Writing/Closing)
+src/http/mod.rs              http module re-exports
+src/http/request.rs          request parser (request line, headers, body)
+src/http/chunked.rs          chunked transfer decoder/encoder
+src/http/multipart.rs        multipart/form-data parser + filename sanitising
+src/http/response.rs         response builder + serialization
+src/router.rs                host+path -> route resolution
+src/handlers/mod.rs          static files, upload, delete, directory listing, redirect
+src/handlers/session_page.rs /session demo page — visit counter, sign-in/out
+src/cgi.rs                   CGI process spawn + non-blocking pipe pumping
+src/error.rs                 status codes -> error pages
+src/utils/mod.rs             utils module re-exports
+src/utils/session.rs         in-memory session store
+src/utils/cookie.rs          Cookie / Set-Cookie parse & build
+src/utils/mime.rs            extension -> Content-Type
+src/utils/path.rs            path resolution + traversal sanitising
 ```
-Add `mio = { version = "1", features = ["os-poll", "net"] }` and `libc`.
+Add `mio = { version = "1", features = ["os-poll", "net", "os-ext"] }` and `libc` (`os-ext` provides `SourceFd` for CGI pipes — see Task 7.1).
+
+> **Note:** `src/http/multipart.rs` (Phase 3.3) and `src/handlers/session_page.rs` (Phase 6.2) were introduced after the initial skeleton but are part of the canonical tree above; the initial printed tree omitted them.
 
 **Why:** The audit asks you to *show the code*. A flat `main.rs` makes every
 question ("show me where you check the return of `write`") an archaeology exercise.
