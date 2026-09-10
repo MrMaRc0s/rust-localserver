@@ -11,7 +11,9 @@ publish = false
 
 [dependencies]
 # Non-blocking I/O readiness only (epoll wrapper). No async runtime, no executor.
-mio = { version = "1", features = ["os-poll", "net"] }
+# "os-ext" provides SourceFd, which is how CGI pipes join the same Poll
+# as the sockets (TASKS.md 7.1) instead of being read with a blocking call.
+mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 # Raw syscalls mio does not expose: fcntl(O_NONBLOCK) on CGI pipes, waitpid, signal.
 libc = "0.2"
 

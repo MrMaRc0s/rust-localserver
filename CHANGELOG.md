@@ -21,6 +21,97 @@ numbering in `TASKS.md`.
 
 ### Added
 
+- **Phase 7.1 — non-blocking CGI** (`src/cgi.rs`, `src/server.rs`): scripts run
+  as child processes whose stdin, stdout and stderr are set `O_NONBLOCK`,
+  wrapped in `mio::unix::SourceFd` and registered in the **same `Poll`** as
+  every socket. The body is pumped in one write per writable event, output
+  collected one read per readable event.
+  _Why:_ this is the whole of `[A-8]`. The obvious implementation —
+  `wait_with_output()` — blocks until the script exits, which with one thread
+  freezes every other client for the script's entire runtime, and fails the
+  question outright since a pipe is a descriptor and reading it is reading.
+  Demonstrated live: while `slow.py` sleeps, `/`, a stylesheet, a directory
+  listing, `/session` **and a second CGI script** were all served in 1–27 ms.
+
+- **Phase 7.2 — the CGI/1.1 environment**: `GATEWAY_INTERFACE`,
+  `REQUEST_METHOD`, `QUERY_STRING`, `SCRIPT_NAME`, `SCRIPT_FILENAME`,
+  `PATH_INFO`, `PATH_TRANSLATED`, `DOCUMENT_ROOT`, `CONTENT_TYPE`,
+  `CONTENT_LENGTH`, `SERVER_*`, `REMOTE_*` and every request header as `HTTP_*`.
+  _Why:_ `PATH_INFO` is the **extra path after the script name**, as RFC 3875
+  defines it — `/cgi-bin/app.py/users/7` gives the script `app.py` and
+  `PATH_INFO=/users/7`. The subject's phrase "use PATH_INFO to define full
+  paths" is answered by `SCRIPT_FILENAME` and `PATH_TRANSLATED`, which carry the
+  absolute filesystem paths; making `PATH_INFO` itself a filesystem path would
+  break any real CGI script. Both are set, so either reading is served.
+
+- **The child's working directory is the script's own directory.**
+  _Why:_ "ensure correct relative path handling" — a script doing
+  `open("data.txt")` must find the file next to itself, not next to wherever the
+  server was started. `cgi-bin/data.txt` exists so `hello.py` can prove it.
+
+- **The child's environment is cleared before it is populated.**
+  _Why:_ a script should see the request, not whatever happened to be exported
+  in the shell that launched the server. `PATH` is restored because an
+  interpreter generally needs one.
+
+- **Phase 7.3 — CGI response translation**: the script's own header block is
+  parsed off the top of stdout, `Status:` sets the response code without being
+  forwarded, and a `Location:` with no explicit status becomes a 302 per
+  RFC 3875.
+  _Why:_ `Connection`, `Transfer-Encoding` and `Content-Length` from a script
+  are **discarded**. Framing belongs to the server: honouring a script's
+  `Content-Length: 999` when it wrote 5 bytes would desynchronise the byte
+  stream for the next request on that keep-alive connection. Output is buffered
+  to a 1 MB cap so the real length is always known, which keeps `HEAD` honest
+  and avoids chunking a response whose size is not in doubt.
+
+- **A 10-second CGI deadline**, shorter than the 30-second connection idle
+  timeout, killing the child and answering 504.
+  _Why:_ without it one infinite loop is a permanent process and three permanent
+  descriptors (`[A-33]`, `[A-34]`). Ordering the two timeouts this way means a
+  runaway script is reported as a gateway timeout rather than decaying into a
+  stalled connection. Verified: `slow.py` answers 504 after 10.1 s.
+
+- **Children are reaped with `try_wait` (`waitpid(WNOHANG)`) from the loop
+  tick, and killed on `Drop`.**
+  _Why:_ an unreaped child is a zombie, which reads at the audit as a process
+  leak; and a client that gives up mid-script must not leave the script running.
+  Measured after 30 CGI requests, a stress run and an aborted request: **0
+  children, 0 zombies, descriptors back to the 7-descriptor baseline**.
+
+- **Phase 7.4 — `cgi-bin/hello.py`** (echoes the environment, the body and a
+  relative file read), **`form.py`** (reads a POSTed body), **`slow.py`** (proves
+  the timeout), and **`info.pl`** — a second CGI system in Perl.
+  _Why:_ `[A-39]`. Adding Perl was **a config change only** — one `.pl` line in
+  the route's `cgi` map — because the interpreter is keyed by file extension and
+  the server knows nothing about any language. That is the thing worth showing
+  an auditor, more than the script itself.
+
+- **26 new tests**: the CGI environment including the `PATH_INFO` /
+  `PATH_TRANSLATED` distinction, `HTTP_*` mangling, response translation,
+  `Status:` handling, `Location:` inference, refusal of framing headers, and
+  absolute script paths. 221 in total.
+
+### Fixed
+
+- **CGI script paths were resolved twice.** The working directory is set to the
+  script's directory, so a *relative* script path — which is what a config
+  relative to `config.yaml` produces — was resolved against it again:
+  `cgi-bin/hello.py` became `cgi-bin/cgi-bin/hello.py` and every script answered
+  an empty 200.
+  _Why:_ paths are now canonicalised when the spec is built, before the child is
+  spawned. There is a test pinning it.
+
+- **Bodies larger than the pipe buffer stalled the script.** The third instance
+  of the same edge-triggered problem, now on pipes: after one write the pipe was
+  often still writable with no state transition, so `EPOLLET` reported nothing
+  more and a 200 KB body hung until the CGI deadline turned it into a 504.
+  _Why:_ pipes are now re-armed on partial progress, exactly as sockets are. The
+  same fix covers output larger than one read. Verified: 100 KB, 200 KB and
+  900 KB bodies all arrive intact through both `Content-Length` and chunked
+  framing.
+
+
 - **Phase 6.1 — cookie utilities** (`src/utils/cookie.rs`): `Cookie:` header
   parsing and a `SetCookie` builder covering `Path`, `Max-Age`, `HttpOnly`,
   `Secure` and `SameSite`.
@@ -649,11 +740,18 @@ numbering in `TASKS.md`.
 
 ### Notes
 
-- The server now serves a real static site end to end, with sessions: GET, HEAD,
-  POST with uploads, DELETE, directory listings, redirects, custom error pages,
-  virtual hosts and cookies. **CGI is the remaining gap** — a request that routes
-  to a script gets a placeholder response naming the interpreter, script and
-  `PATH_INFO` it would have used (Phase 7).
+- Every mandatory feature in the subject is now implemented: the event loop,
+  configuration, HTTP/1.1 parsing, routing, static files, uploads, deletion,
+  directory listings, redirects, error pages, virtual hosts, cookies, sessions
+  and CGI. What remains in `TASKS.md` is Phase 8 (the metrics bonus), Phase 9
+  (the integration test suite and the hardening pass) and Phase 10 (audit
+  rehearsal).
+- **CGI throughput is bounded by the interpreter, not the server.** Measured on
+  this machine: `hello.py` takes 187 ms run directly and 190 ms through the
+  server — about 3 ms of overhead — because Python's startup dominates. The same
+  request in Perl is 42 ms. Under `siege` the CGI endpoint sustains 100%
+  availability at ~5 trans/sec with 25 concurrent users on 4 cores, which is 25
+  interpreters starting at once rather than anything the loop is doing.
 - The `/session` paths are built in rather than configured, like the metrics
   endpoint planned for Phase 8: they report on the server itself, so there is no
   document root they could sensibly be mapped to. The prefix is a single
@@ -664,10 +762,11 @@ numbering in `TASKS.md`.
   was caught by hand with a 700 KB POST.
 - `cargo build`, `cargo build --release` and `cargo clippy --all-targets` are
   clean; `cargo test` runs 117 passing tests.
-- **siege, 20 s, default 25 users, with sessions active**: `/empty.html` 81,555
-  transactions at 4006 trans/sec, **100.00% availability**, 0 failed. File
-  descriptors stayed at the 7-descriptor baseline, RSS moved 2552 kB → 2588 kB,
-  and 33 sessions were held afterwards. File descriptors returned to the 7-descriptor baseline and no
+- **siege, 15 s, default 25 users**: `/empty.html` 57,671 transactions at 3809
+  trans/sec and `/cgi-bin/hello.py` 79 transactions at 5 trans/sec, **100.00%
+  availability and 0 failed on both**. Afterwards: descriptors at the
+  7-descriptor baseline, RSS unchanged, no children, no zombies, no
+  `CLOSE_WAIT`. File descriptors returned to the 7-descriptor baseline and no
   `CLOSE_WAIT` sockets remained. The 99.5% target in `[A-32]` is met, though it
   must be re-measured once the filesystem is in the path.
 - Not yet done: `Method::Put`/`Options` parse but no handler implements them.

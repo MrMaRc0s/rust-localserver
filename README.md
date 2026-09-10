@@ -10,15 +10,14 @@ no server framework — `mio` supplies readiness notifications and nothing else.
 
 ## Status
 
-Phases 0–6 complete. The server serves a real static site end to end: GET,
-HEAD, POST with file uploads, DELETE, directory listings, redirects, custom
-error pages, virtual hosts, and cookie-backed sessions — over a single-threaded
-non-blocking event loop. 204 passing tests, clean under
+Phases 0–7 complete: **every mandatory feature in the subject is implemented.**
+GET, HEAD, POST with file uploads, DELETE, directory listings, redirects, custom
+error pages, virtual hosts, cookie-backed sessions and CGI — all over a
+single-threaded non-blocking event loop. 221 passing tests, clean under
 `cargo clippy --all-targets`.
 
-**CGI is the remaining gap** — a request routed to a script returns a
-placeholder naming the interpreter, script and `PATH_INFO` it would have used
-(Phase 7 of `TASKS.md`).
+What remains in `TASKS.md` is the metrics bonus (Phase 8), the integration test
+suite and hardening pass (Phase 9), and the audit rehearsal (Phase 10).
 
 ```bash
 cargo run --release -- config.yaml   # binds 8080, 8081, 8082
@@ -26,8 +25,10 @@ curl -i http://127.0.0.1:8080/
 echo $?                              # 2 if the configuration is unusable
 ```
 
-Measured with `siege -b -t20S http://127.0.0.1:8080/empty.html`: **100.00%
-availability** over 81,555 transactions at 4006 trans/sec, 0 failed. File descriptors return to
+Measured with `siege -b -t15S http://127.0.0.1:8080/empty.html`: **100.00%
+availability** over 57,671 transactions at 3809 trans/sec, 0 failed. The CGI
+endpoint is also 100% available; its throughput is bounded by interpreter
+startup (187 ms for python on this machine, of which the server adds ~3 ms). File descriptors return to
 baseline and RSS stays flat — a 10 MB download moves it by 128 KB, because
 bodies are streamed rather than buffered.
 
@@ -48,6 +49,7 @@ Then open <http://127.0.0.1:8080/>.
 | Readiness | Exactly one `read()` or one `write()` syscall per client per readiness event, so no single peer can monopolise the loop. `mio` is edge-triggered, so a socket that may still hold data is **re-armed** with `EPOLL_CTL_MOD` rather than drained in a loop. |
 | File bodies | Streamed: a file over 64 KB stays on disk and is pulled one chunk per writable event, so memory never holds more than a chunk. Files under a chunk go out inline with their headers, saving two syscalls and two epoll re-arms on the traffic a static site is mostly made of. |
 | Error pages | The page configured for that status, else one compiled into the binary. The fallback is load-bearing: an error page that itself fails would otherwise recurse. |
+| CGI | Child processes whose three pipes are `O_NONBLOCK` and registered in the **same `Poll`** as every socket — a slow script never blocks another client. Killed after 10 s (→ 504), reaped with `waitpid(WNOHANG)`, and killed on `Drop` if the client gives up. The interpreter is chosen by file extension in the config, so a second language is a config change. |
 | Sessions | 32 bytes from `/dev/urandom`, hex-encoded, in a `HashMap` behind `Rc<RefCell<_>>` — **no `Mutex`**, because one thread means there is nothing to synchronise. Sliding 30-minute expiry, swept from the loop tick once a minute, capped at 10,000. If the CSPRNG is unreadable the server issues no sessions rather than weak ones. |
 | Cookies | `HttpOnly` and `SameSite=Lax` by default; `Secure` deliberately off, since a `Secure` cookie would never come back over plain HTTP. Values that could inject a header are refused rather than escaped. |
 | Blocking | Nothing blocks. Partial requests and partial responses live in per-connection buffers across loop iterations; CGI stdin/stdout are `O_NONBLOCK` pipes registered in the same `Poll`. |
@@ -100,7 +102,7 @@ The shipped file demonstrates each supported feature:
 | Directory root | `root:` per route |
 | Default file for a directory | `index: index.html` |
 | Directory listing toggle | `autoindex:` per route |
-| CGI by extension | `cgi: { ".py": /usr/bin/python3 }` |
+| CGI by extension | `cgi:` maps `.py` → python3 and `.pl` → perl on one route |
 | Upload destination | `upload_dir: uploads` |
 
 ## Layout
@@ -108,6 +110,16 @@ The shipped file demonstrates each supported feature:
 Session behaviour is visible at <http://127.0.0.1:8080/session>: the id, a visit
 counter that climbs on reload, a sliding expiry, and a sign-in form. The cookie
 itself is in devtools under Application → Cookies.
+
+CGI lives under <http://127.0.0.1:8080/cgi-bin/>: `hello.py` echoes the
+environment it was given (including `PATH_INFO`, `SCRIPT_FILENAME` and a file
+read with a *relative* path, which only works because the child runs in the
+script's own directory), `form.py` reads a POSTed body, and `info.pl` is the
+same route serving a different language — added by one line of config.
+
+`PATH_INFO` is the extra path after the script name, as RFC 3875 defines it:
+`/cgi-bin/hello.py/users/7` gives the script `PATH_INFO=/users/7`. The absolute
+filesystem paths are in `SCRIPT_FILENAME` and `PATH_TRANSLATED`.
 
 ```
 config.yaml     server configuration (edit this, not the code)

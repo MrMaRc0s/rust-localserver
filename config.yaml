@@ -68,14 +68,17 @@ servers:
         autoindex: true
 
       # CGI by extension. The interpreter is a config value, so adding a
-      # second language is a config change, not a code change.
+      # second language is a config change, not a code change -- the .pl entry
+      # below is the whole of the "more than one CGI system" bonus.
       - path: /cgi-bin
         methods:
           - GET
           - POST
         root: cgi-bin
+        autoindex: true
         cgi:
           ".py": /usr/bin/python3
+          ".pl": /usr/bin/perl
 
       # Redirection.
       - path: /old-page

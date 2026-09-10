@@ -72,6 +72,7 @@ use mio::{Interest, Token};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::cgi::CgiSpec;
 use crate::config::{Method, ServerConfig};
 use crate::error;
 use crate::handlers::session_page::{self, Command};
@@ -100,6 +101,10 @@ pub enum Action {
     Keep,
     /// Deregister, close the socket, forget the connection.
     Close,
+    /// A CGI script must be started. Only the server can do that: spawning
+    /// means registering three more descriptors in the poll it owns. The spec
+    /// is waiting in [`Connection::take_cgi_spec`].
+    StartCgi,
 }
 
 /// The result of one I/O syscall, normalised.
@@ -156,6 +161,10 @@ pub enum State {
     ReadingBody,
     /// A response is queued; flushing it.
     Writing,
+    /// A CGI script is running. The connection stays registered as readable so
+    /// a client that gives up is noticed, but nothing is parsed until the
+    /// script finishes.
+    AwaitingCgi,
 }
 
 /// What to do once the queued bytes have been flushed.
@@ -208,6 +217,10 @@ pub struct Connection {
     keep_alive: bool,
     /// A `100 Continue` has already been sent for the request in progress.
     sent_continue: bool,
+    /// Set when routing decided on CGI; the server collects it.
+    pending_cgi: Option<Box<CgiSpec>>,
+    /// The port this connection arrived on, for the CGI `SERVER_PORT`.
+    local_port: u16,
     /// Servers sharing the listener this connection arrived on; the router
     /// picks between them by `Host`.
     servers: Rc<Vec<ServerConfig>>,
@@ -239,6 +252,7 @@ impl Connection {
         peer: SocketAddr,
         token: Token,
         max_body: usize,
+        local_port: u16,
         servers: Rc<Vec<ServerConfig>>,
         sessions: Rc<RefCell<SessionStore>>,
     ) -> Connection {
@@ -256,6 +270,8 @@ impl Connection {
             after_write: AfterWrite::Close,
             keep_alive: true,
             sent_continue: false,
+            pending_cgi: None,
+            local_port,
             servers,
             sessions,
             limit_narrowed: false,
@@ -278,6 +294,9 @@ impl Connection {
         match self.state {
             State::ReadingHeaders | State::ReadingBody => Interest::READABLE,
             State::Writing => Interest::WRITABLE,
+            // Not waiting to send anything, but still worth hearing about a
+            // client that hangs up while the script runs.
+            State::AwaitingCgi => Interest::READABLE,
         }
     }
 
@@ -332,6 +351,15 @@ impl Connection {
     pub fn on_readable(&mut self) -> Action {
         let mut chunk = [0u8; READ_CHUNK];
         match self.read_once(&mut chunk) {
+            IoOutcome::Progress(n) if self.state == State::AwaitingCgi => {
+                // A script is running, so this cannot be answered yet. Feed the
+                // parser so a pipelined request is not lost, but ignore what it
+                // concludes: queueing a second response now would clobber the
+                // one the script is about to produce. `reset_for_next_request`
+                // re-drives the parser once the CGI response has gone out.
+                let _ = self.parser.feed(&chunk[..n]);
+                Action::Keep
+            }
             IoOutcome::Progress(n) => self.process(&chunk[..n]),
             // The peer closed. If a response is still queued we cannot deliver
             // it, so there is nothing to do but drop the connection.
@@ -450,7 +478,20 @@ impl Connection {
                 self.limit_narrowed = false;
                 self.keep_alive = request.wants_keep_alive();
                 self.requests += 1;
-                let reply = build_reply(&self.servers, &self.sessions, &request);
+                let mut spec: Option<Box<CgiSpec>> = None;
+                let reply = build_reply(
+                    &self.servers,
+                    &self.sessions,
+                    &request,
+                    self.peer,
+                    self.local_port,
+                    &mut spec,
+                );
+                if let Some(spec) = spec {
+                    self.pending_cgi = Some(spec);
+                    self.await_cgi();
+                    return Action::StartCgi;
+                }
                 let next = if self.keep_alive { AfterWrite::NextRequest } else { AfterWrite::Close };
                 self.queue_reply(reply, next);
                 Action::Keep
@@ -485,6 +526,23 @@ impl Connection {
         self.body_source = body;
         self.after_write = after;
         self.state = State::Writing;
+    }
+
+    /// Take the CGI spec the router produced, for the server to act on.
+    pub fn take_cgi_spec(&mut self) -> Option<Box<CgiSpec>> {
+        self.pending_cgi.take()
+    }
+
+    /// Park the connection while a script runs.
+    pub fn await_cgi(&mut self) {
+        self.state = State::AwaitingCgi;
+    }
+
+    /// Deliver what a script produced, or the error that replaced it.
+    pub fn deliver_cgi(&mut self, reply: Reply) -> Action {
+        let next = if self.keep_alive { AfterWrite::NextRequest } else { AfterWrite::Close };
+        self.queue_reply(reply, next);
+        Action::Keep
     }
 
     /// Serialize an error response.
@@ -584,6 +642,10 @@ impl Connection {
             // A response that cannot be flushed within the idle window is a
             // dead peer; there is nothing useful left to send.
             State::Writing => Action::Close,
+            // Bounded by the CGI deadline instead, which is shorter than the
+            // idle timeout, so reaching this means the script already answered
+            // or was killed. Closing is the safe reading.
+            State::AwaitingCgi => Action::Close,
         }
     }
 
@@ -603,13 +665,24 @@ fn build_reply(
     servers: &[ServerConfig],
     sessions: &Rc<RefCell<SessionStore>>,
     request: &Request,
+    remote: SocketAddr,
+    port: u16,
+    cgi: &mut Option<Box<CgiSpec>>,
 ) -> Reply {
     let session = resolve_session(sessions, request);
 
     let mut reply = if session_page::owns(&request.path) {
         session_demo(sessions, request, &session)
     } else {
-        route_request(servers, request)
+        match route_request(servers, request, remote, port) {
+            Routed::Reply(reply) => reply,
+            Routed::Cgi(spec) => {
+                // Hand the spec back: only the server can spawn, because
+                // spawning means registering pipes in the poll it owns.
+                *cgi = Some(spec);
+                return Reply::immediate(Response::new(200));
+            }
+        }
     };
 
     // Only when a session was just issued: re-sending an unchanged cookie on
@@ -706,14 +779,25 @@ fn session_demo(
     }
 }
 
+/// What routing concluded: a finished reply, or a script to run.
+enum Routed {
+    Reply(Reply),
+    Cgi(Box<CgiSpec>),
+}
+
 /// Select the virtual host, resolve the route, then hand off to the handler.
-fn route_request(servers: &[ServerConfig], request: &Request) -> Reply {
+fn route_request(
+    servers: &[ServerConfig],
+    request: &Request,
+    remote: SocketAddr,
+    port: u16,
+) -> Routed {
     let host = request.host();
     let server = match router::select_server(servers, host.as_deref()) {
         Some(server) => server,
         // A listener always has at least one server, so this cannot happen; if
         // it somehow does it is a server fault, not the client's.
-        None => return Reply::immediate(error::builtin(500)),
+        None => return Routed::Reply(Reply::immediate(error::builtin(500))),
     };
 
     let head_only = request.method_enum() == Some(Method::Head);
@@ -737,7 +821,9 @@ fn route_request(servers: &[ServerConfig], request: &Request) -> Reply {
 
         // RFC 9110 requires Allow on a 405 so the client learns what it may use.
         Resolution::MethodNotAllowed { allow } => {
-            return Reply::immediate(error::page(server, 405).header("Allow", &allow))
+            return Routed::Reply(Reply::immediate(
+                error::page(server, 405).header("Allow", &allow),
+            ))
         }
 
         Resolution::File { path } => handlers::file(&path, head_only),
@@ -754,29 +840,26 @@ fn route_request(servers: &[ServerConfig], request: &Request) -> Reply {
 
         Resolution::Delete { path } => handlers::delete(&path),
 
-        // TASKS.md 7.1 replaces this with the non-blocking CGI pump.
-        Resolution::Cgi { interpreter, script, path_info } => Ok(Reply::immediate(
-            Response::with_body(
-                200,
-                "text/plain; charset=utf-8",
-                format!(
-                    "CGI not implemented yet (TASKS.md phase 7)\n\
-                     interpreter: {}\nscript: {}\nPATH_INFO: {path_info:?}\n",
-                    interpreter.display(),
-                    script.display()
-                )
-                .into_bytes(),
-            )
-            .head_only(head_only),
-        )),
+        Resolution::Cgi { interpreter, script, path_info } => {
+            let document_root = match router::match_route(server, &request.path) {
+                Some(route) => route.root.clone(),
+                None => script.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+            };
+            return Routed::Cgi(Box::new(crate::cgi::spec_from_request(
+                crate::cgi::CgiTarget { interpreter, script, path_info, document_root },
+                crate::cgi::CgiOrigin { remote, port, head_only },
+                request,
+                server,
+            )));
+        }
 
         Resolution::Error(status) => Err(status),
     };
 
-    match outcome {
+    Routed::Reply(match outcome {
         Ok(reply) => reply,
         Err(status) => Reply::immediate(error::page(server, status).head_only(head_only)),
-    }
+    })
 }
 
 #[cfg(test)]

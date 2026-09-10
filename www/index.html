@@ -28,11 +28,20 @@
     <li><a href="/uploads/">/uploads/</a> &mdash; upload target, GET/POST/DELETE</li>
     <li><a href="/readonly/">/readonly/</a> &mdash; same files, DELETE returns 405</li>
     <li><a href="/old-page">/old-page</a> &mdash; 301 redirect back here</li>
-    <li><a href="/cgi-bin/hello.py">/cgi-bin/hello.py</a> &mdash; CGI</li>
+    <li><a href="/cgi-bin/hello.py">/cgi-bin/hello.py</a> &mdash; CGI (python)</li>
+    <li><a href="/cgi-bin/info.pl">/cgi-bin/info.pl</a> &mdash; CGI (perl, same route)</li>
+    <li><a href="/cgi-bin/form.py">/cgi-bin/form.py</a> &mdash; CGI reading a POST body</li>
     <li><a href="/no-such-page">/no-such-page</a> &mdash; custom 404 page</li>
     <li><a href="/empty.html">/empty.html</a> &mdash; empty page used for siege</li>
     <li><a href="/session">/session</a> &mdash; session and cookie demo</li>
   </ul>
+
+  <h2>CGI</h2>
+  <p>Scripts run as child processes whose pipes are registered in the
+  <em>same</em> epoll as every socket, so a slow script never blocks another
+  client. The interpreter is chosen by file extension in
+  <code>config.yaml</code>, which is why python and perl scripts share one
+  route without the server knowing either language.</p>
 
   <h2>Sessions</h2>
   <p>Every response carries a <code>Set-Cookie</code> the first time a browser

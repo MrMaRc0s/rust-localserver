@@ -46,16 +46,28 @@ use std::time::{Duration, Instant};
 
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
+use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::config::{Config, ServerConfig};
+use crate::cgi::{CgiProcess, CgiStep};
 use crate::connection::{Action, Connection, Timeout};
+use crate::error;
+use crate::handlers::Reply;
 use crate::utils::session::{SessionStore, DEFAULT_TTL};
 
 /// Listener tokens occupy `[0, CONNECTION_TOKEN_BASE)`, connection tokens start
 /// at `CONNECTION_TOKEN_BASE`. Dispatch is then a single comparison, and a
 /// stale event for a closed connection cannot be mistaken for a listener.
 const CONNECTION_TOKEN_BASE: usize = 1 << 20;
+
+/// CGI pipe tokens start above every connection token, so the same single
+/// comparison chain that separates listeners from connections also separates
+/// connections from pipes. Three descriptors are registered per script — stdin,
+/// stdout and stderr — in the **same** `Poll` as every socket, which is what
+/// makes a script's I/O just another source of readiness rather than a reason
+/// to block ([A-8]).
+const CGI_TOKEN_BASE: usize = 2 << 20;
 
 /// How long `poll()` may wait when nothing is ready. This is the resolution of
 /// timeout sweeping, not a delay imposed on requests: any actual readiness wakes
@@ -81,6 +93,14 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// instead: pending connections wait in the kernel backlog, which is exactly
 /// what a backlog is for.
 const MAX_CONNECTIONS: usize = 512;
+
+/// Which of a script's three pipes an event concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pipe {
+    Stdin,
+    Stdout,
+    Stderr,
+}
 
 /// A bound listening socket and the address it answers on.
 struct Listener {
@@ -120,6 +140,13 @@ pub struct Server {
     /// enough; see [`crate::utils::session`].
     sessions: Rc<RefCell<SessionStore>>,
     last_session_sweep: Instant,
+    /// Running scripts, keyed by the connection waiting for each.
+    cgi: HashMap<Token, CgiProcess>,
+    /// Pipe token to the connection that owns it, so a pipe event can be routed
+    /// back to its script in one lookup.
+    cgi_pipes: HashMap<Token, Token>,
+    next_cgi_token: usize,
+    free_cgi_tokens: Vec<usize>,
 }
 
 impl Server {
@@ -214,6 +241,10 @@ impl Server {
             accepted: 0,
             sessions: Rc::new(RefCell::new(SessionStore::new(DEFAULT_TTL))),
             last_session_sweep: Instant::now(),
+            cgi: HashMap::new(),
+            cgi_pipes: HashMap::new(),
+            next_cgi_token: CGI_TOKEN_BASE,
+            free_cgi_tokens: Vec::new(),
         })
     }
 
@@ -233,14 +264,17 @@ impl Server {
                 let token = event.token();
                 if token.0 < CONNECTION_TOKEN_BASE {
                     self.accept_from(token);
-                } else {
+                } else if token.0 < CGI_TOKEN_BASE {
                     self.dispatch(token, event);
+                } else {
+                    self.dispatch_cgi(token, event);
                 }
             }
 
             // Runs on every iteration, including the ones where `poll` returned
             // because of the tick rather than because of traffic.
             self.sweep_timeouts();
+            self.sweep_cgi();
             self.sweep_sessions();
         }
     }
@@ -266,6 +300,7 @@ impl Server {
             let max_body = self.listeners[index].max_body;
             let servers = Rc::clone(&self.listeners[index].servers);
             let sessions = Rc::clone(&self.sessions);
+            let port = self.listeners[index].port;
             let (socket, peer) = match self.listeners[index].socket.accept() {
                 Ok(pair) => pair,
                 // Backlog drained: the normal way out of this loop.
@@ -282,7 +317,7 @@ impl Server {
                 }
             };
 
-            self.register_connection(socket, peer, max_body, servers, sessions);
+            self.register_connection(socket, peer, max_body, port, servers, sessions);
         }
     }
 
@@ -291,6 +326,7 @@ impl Server {
         mut socket: TcpStream,
         peer: SocketAddr,
         max_body: usize,
+        port: u16,
         servers: Rc<Vec<ServerConfig>>,
         sessions: Rc<RefCell<SessionStore>>,
     ) {
@@ -316,7 +352,7 @@ impl Server {
         self.connections
             .insert(
                 token,
-                Connection::new(socket, peer, token, max_body, servers, sessions),
+                Connection::new(socket, peer, token, max_body, port, servers, sessions),
             );
         self.accepted += 1;
     }
@@ -358,6 +394,10 @@ impl Server {
         match action {
             Action::Close => self.close(token),
             Action::Keep => self.sync_interest(token, interest, rearm),
+            Action::StartCgi => {
+                self.sync_interest(token, interest, rearm);
+                self.start_cgi(token);
+            }
         }
     }
 
@@ -397,6 +437,11 @@ impl Server {
     /// `close()` explicitly. Deregistering first stops the poll from reporting
     /// events for a descriptor that is about to disappear.
     fn close(&mut self, token: Token) {
+        // A client that gives up mid-script must not leave the script running:
+        // dropping the process kills and reaps it.
+        if let Some(mut process) = self.cgi.remove(&token) {
+            self.release_cgi_pipes(&mut process);
+        }
         if let Some(mut connection) = self.connections.remove(&token) {
             let _ = self.poll.registry().deregister(&mut connection.socket);
             // Best effort: the peer may already be gone, which is not an error
@@ -453,6 +498,299 @@ impl Server {
         }
         self.throttled = false;
         eprintln!("localserver: resuming accept");
+    }
+
+    // ---------------------------------------------------------------------
+    // CGI
+    // ---------------------------------------------------------------------
+
+    /// Spawn the script a connection asked for and register its pipes.
+    ///
+    /// This is the heart of audit question [A-8]: the three pipes go into the
+    /// **same** `Poll` as every socket, so the script's I/O is just more
+    /// readiness to react to. The alternative — `wait_with_output()` — would
+    /// block the single thread for the script's entire runtime and freeze every
+    /// other client.
+    fn start_cgi(&mut self, connection: Token) {
+        let spec = match self.connections.get_mut(&connection).and_then(|c| c.take_cgi_spec()) {
+            Some(spec) => spec,
+            None => return,
+        };
+
+        let stdin_token = Token(self.alloc_cgi_token());
+        let stdout_token = Token(self.alloc_cgi_token());
+        let stderr_token = Token(self.alloc_cgi_token());
+
+        let mut process = match CgiProcess::spawn(&spec, stdin_token, stdout_token, stderr_token) {
+            Ok(process) => process,
+            Err(e) => {
+                eprintln!(
+                    "localserver: could not start {}: {e}",
+                    spec.interpreter.display()
+                );
+                self.free_cgi_tokens.extend([stdin_token.0, stdout_token.0, stderr_token.0]);
+                self.finish_cgi_with_status(connection, 502);
+                return;
+            }
+        };
+
+        // stdout and stderr are always watched; stdin only while there is a
+        // body to hand over, and it is closed immediately otherwise so a script
+        // reading to EOF is not left waiting.
+        let mut registered: Vec<Token> = Vec::new();
+        if process.has_input() {
+            if let Some(fd) = process.stdin_fd() {
+                if self
+                    .poll
+                    .registry()
+                    .register(&mut SourceFd(&fd), stdin_token, Interest::WRITABLE)
+                    .is_ok()
+                {
+                    registered.push(stdin_token);
+                } else {
+                    process.close_stdin();
+                }
+            }
+        } else {
+            process.close_stdin();
+        }
+
+        for (fd, token) in [
+            (process.stdout_fd(), stdout_token),
+            (process.stderr_fd(), stderr_token),
+        ] {
+            if let Some(fd) = fd {
+                if self
+                    .poll
+                    .registry()
+                    .register(&mut SourceFd(&fd), token, Interest::READABLE)
+                    .is_ok()
+                {
+                    registered.push(token);
+                }
+            }
+        }
+
+        if registered.is_empty() {
+            eprintln!("localserver: no CGI pipe could be registered, answering 502");
+            self.finish_cgi_with_status(connection, 502);
+            return;
+        }
+
+        for token in registered {
+            self.cgi_pipes.insert(token, connection);
+        }
+        self.cgi.insert(connection, process);
+    }
+
+    /// One readiness event on one CGI pipe: one read, or one write.
+    fn dispatch_cgi(&mut self, token: Token, event: &Event) {
+        let connection = match self.cgi_pipes.get(&token) {
+            Some(connection) => *connection,
+            // A pipe event for a script that has already been torn down.
+            None => return,
+        };
+
+        let (step, which) = {
+            let process = match self.cgi.get_mut(&connection) {
+                Some(process) => process,
+                None => return,
+            };
+            if token == process.stdin_token && event.is_writable() {
+                (process.on_stdin_writable(), Pipe::Stdin)
+            } else if token == process.stdout_token {
+                (process.on_stdout_readable(), Pipe::Stdout)
+            } else if token == process.stderr_token {
+                (process.on_stderr_readable(), Pipe::Stderr)
+            } else {
+                return;
+            }
+        };
+
+        match step {
+            // More to move on this pipe. The registration is edge-triggered
+            // like every other, so a pipe that is still ready after one
+            // syscall reports nothing further on its own: a body larger than
+            // the 64 KB pipe buffer, or output larger than one read, would
+            // stall halfway. Re-arming reports readiness again if there is any,
+            // and stays silent if there is not — no spin either way.
+            CgiStep::Continue => self.rearm_cgi_pipe(connection, token, which),
+            CgiStep::Closed => self.close_cgi_pipe(connection, token, which),
+            CgiStep::Failed(status) => {
+                // Output cap exceeded, or an unusable pipe.
+                self.kill_cgi(connection);
+                self.finish_cgi_with_status(connection, status);
+                return;
+            }
+        }
+
+        // Both output streams at EOF: the script has said all it will.
+        let complete = self
+            .cgi
+            .get(&connection)
+            .map(|process| process.output_complete())
+            .unwrap_or(false);
+        if complete {
+            self.finish_cgi(connection);
+        }
+    }
+
+    /// Re-arm one pipe's edge-triggered registration.
+    fn rearm_cgi_pipe(&mut self, connection: Token, token: Token, which: Pipe) {
+        let process = match self.cgi.get(&connection) {
+            Some(process) => process,
+            None => return,
+        };
+        let (fd, interest) = match which {
+            Pipe::Stdin => (process.stdin_fd(), Interest::WRITABLE),
+            Pipe::Stdout => (process.stdout_fd(), Interest::READABLE),
+            Pipe::Stderr => (process.stderr_fd(), Interest::READABLE),
+        };
+        if let Some(fd) = fd {
+            let _ = self
+                .poll
+                .registry()
+                .reregister(&mut SourceFd(&fd), token, interest);
+        }
+    }
+
+    /// Deregister one pipe and close it.
+    fn close_cgi_pipe(&mut self, connection: Token, token: Token, which: Pipe) {
+        if let Some(process) = self.cgi.get_mut(&connection) {
+            // Deregister before dropping: the descriptor must still be open for
+            // the poll to stop watching it.
+            let fd = match which {
+                Pipe::Stdin => process.stdin_fd(),
+                Pipe::Stdout => process.stdout_fd(),
+                Pipe::Stderr => process.stderr_fd(),
+            };
+            if let Some(fd) = fd {
+                let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
+            }
+            match which {
+                Pipe::Stdin => process.close_stdin(),
+                Pipe::Stdout => process.close_stdout(),
+                Pipe::Stderr => process.close_stderr(),
+            }
+        }
+        self.cgi_pipes.remove(&token);
+        self.free_cgi_tokens.push(token.0);
+    }
+
+    /// Take the script's output, turn it into a response, and wake the client.
+    fn finish_cgi(&mut self, connection: Token) {
+        let mut process = match self.cgi.remove(&connection) {
+            Some(process) => process,
+            None => return,
+        };
+        self.release_cgi_pipes(&mut process);
+
+        // waitpid(WNOHANG): report the exit without waiting for it, so a script
+        // that has finished does not linger as a zombie.
+        let code = process.reap();
+        let stderr = process.stderr_text();
+        if !stderr.is_empty() {
+            eprintln!("localserver: CGI stderr: {stderr}");
+        }
+        if let Some(code) = code {
+            if code != 0 {
+                eprintln!("localserver: CGI exited with status {code}");
+            }
+        }
+
+        let response = process.into_response();
+        self.wake_connection(connection, Reply::immediate(response));
+    }
+
+    /// Answer the waiting client with an error instead of script output.
+    fn finish_cgi_with_status(&mut self, connection: Token, status: u16) {
+        if let Some(mut process) = self.cgi.remove(&connection) {
+            self.release_cgi_pipes(&mut process);
+        }
+        let response = error::builtin(status);
+        self.wake_connection(connection, Reply::immediate(response));
+    }
+
+    /// Deregister and forget whatever pipes a process still holds.
+    fn release_cgi_pipes(&mut self, process: &mut CgiProcess) {
+        for (fd, token) in [
+            (process.stdin_fd(), process.stdin_token),
+            (process.stdout_fd(), process.stdout_token),
+            (process.stderr_fd(), process.stderr_token),
+        ] {
+            if let Some(fd) = fd {
+                let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
+            }
+            if self.cgi_pipes.remove(&token).is_some() {
+                self.free_cgi_tokens.push(token.0);
+            }
+        }
+        process.close_stdin();
+        process.close_stdout();
+        process.close_stderr();
+    }
+
+    fn kill_cgi(&mut self, connection: Token) {
+        if let Some(process) = self.cgi.get_mut(&connection) {
+            process.kill();
+        }
+    }
+
+    /// Hand a reply to the connection that was parked waiting for it.
+    fn wake_connection(&mut self, token: Token, reply: Reply) {
+        let action = match self.connections.get_mut(&token) {
+            Some(connection) => connection.deliver_cgi(reply),
+            // The client gave up while the script ran.
+            None => return,
+        };
+        match action {
+            Action::Close => self.close(token),
+            Action::StartCgi | Action::Keep => {
+                let interest = match self.connections.get(&token) {
+                    Some(connection) => connection.desired_interest(),
+                    None => return,
+                };
+                // Force the re-register: the connection was already readable,
+                // and without re-arming an edge-triggered registration would
+                // never report it writable.
+                self.sync_interest(token, interest, true);
+            }
+        }
+    }
+
+    /// Kill scripts that overran their deadline, and reap any that exited
+    /// without their pipes reaching EOF.
+    ///
+    /// Without this an infinite loop in a script is a permanent process and
+    /// three permanent file descriptors ([A-33], [A-34]).
+    fn sweep_cgi(&mut self) {
+        if self.cgi.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let expired: Vec<Token> = self
+            .cgi
+            .iter()
+            .filter(|(_, process)| process.timed_out(now))
+            .map(|(connection, _)| *connection)
+            .collect();
+
+        for connection in expired {
+            eprintln!("localserver: CGI script exceeded its deadline, killing it");
+            self.kill_cgi(connection);
+            self.finish_cgi_with_status(connection, 504);
+        }
+    }
+
+    fn alloc_cgi_token(&mut self) -> usize {
+        match self.free_cgi_tokens.pop() {
+            Some(number) => number,
+            None => {
+                let number = self.next_cgi_token;
+                self.next_cgi_token += 1;
+                number
+            }
+        }
     }
 
     /// Drop expired sessions, at most once a minute.
@@ -514,7 +852,8 @@ impl Server {
             };
             match action {
                 Action::Close => self.close(token),
-                Action::Keep => {
+                // A timing-out connection never starts a script.
+                Action::StartCgi | Action::Keep => {
                     let interest = match self.connections.get(&token) {
                         Some(c) => c.desired_interest(),
                         None => continue,
