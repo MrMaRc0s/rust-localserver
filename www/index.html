@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LocalServer</title>
   <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/audit-console.js" defer></script>
+  <script src="/static/audit-console.js?v=2" defer></script>
 </head>
 <body>
 <main>
@@ -439,7 +439,7 @@
             <span class="status-badge status-4xx">Traversal Block</span>
           </div>
           <div class="q-title">Wrong URL / Path Traversal</div>
-          <div class="q-desc">Attempt directory traversal /../../etc/passwd &mdash; verified blocked with 403 or 404.</div>
+          <div class="q-desc">Attempt encoded traversal /%2e%2e%2f%2e%2e%2fetc%2fpasswd &mdash; must be blocked with 403 Forbidden. (Raw /../../etc/passwd is normalized by the browser to /etc/passwd before it reaches the server.)</div>
         </div>
         <div>
           <div class="card-actions">

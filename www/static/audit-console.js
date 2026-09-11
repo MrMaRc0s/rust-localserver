@@ -444,17 +444,24 @@
       return ok;
     },
 
-    // [A-25] Wrong URL / Path Traversal — must use ENCODED traversal.
-    // Raw fetch('/../../etc/passwd') is normalized by the browser to
-    // '/etc/passwd' -> 404 before it ever reaches the server. Encoded
-    // %2e%2e hits the real 403 defence (decode-first, path.rs).
+    // [A-25] Wrong URL / Path Traversal — must use ENCODED traversal with %2f.
+    // Raw fetch('/../../etc/passwd') and fetch('/%2e%2e/%2e%2e/etc/passwd')
+    // are normalized by the browser to '/etc/passwd' -> 404 (WHATWG URL spec
+    // normalizes %2e%2e between literal slashes). Encoding slashes as %2f
+    // prevents browser normalization and sends the traversal to the server,
+    // hitting the real 403 defence (decode-first, path.rs).
+    // NOTE: all slashes encoded, so the URL is a single segment and no
+    // browser dot-segment removal can trigger. If this still returns 404
+    // with res.url ending in /etc/passwd, the browser ran a cached copy of
+    // this file — hard-refresh (Ctrl+Shift+R).
     async a25(box) {
       const start = performance.now();
-      const res = await fetch('/%2e%2e/%2e%2e/etc/passwd');
+      const probe = '/%2e%2e%2f%2e%2e%2fetc%2fpasswd';
+      const res = await fetch(probe);
       const text = await res.text();
       const ok = res.status === 403;
       renderCardResult(box, res.status, res.statusText, res.headers, text, performance.now() - start,
-        `[A-25] Encoded path traversal blocked with status ${res.status} (expected 403).`, ok);
+        `[A-25] GET ${probe} -> ${res.url} blocked with status ${res.status} (expected 403).`, ok);
       return ok;
     },
 

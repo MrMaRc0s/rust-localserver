@@ -829,6 +829,10 @@ fn test_s_traversal_encoding_distinction() {
     let enc = request(8080, "GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert_eq!(enc.status, 403, "encoded traversal must be 403");
 
+    // Encoded slashes `%2f` prevent browser URL normalization from stripping `..`.
+    let enc_slash = request(8080, "GET /%2e%2e%2f%2e%2e%2fetc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert_eq!(enc_slash.status, 403, "encoded slash traversal must be 403");
+
     // NUL → 400.
     let nul = request(8080, "GET /%00invalid-nul HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert_eq!(nul.status, 400);
